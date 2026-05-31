@@ -80,3 +80,21 @@ export interface Summary {
 export type ViewKey = "overview" | "monitors" | "regions" | "incidents" | "usage" | "placement" | "tokens";
 export type DetailTab = "overview" | "regions" | "alerts" | "settings";
 export type StatusFilter = "all" | "up" | "down" | "idle";
+
+export type MonitorConfigPatch = Partial<
+  Pick<
+    MonitorConfig,
+    | "name"
+    | "url"
+    | "method"
+    | "expectedStatusMin"
+    | "expectedStatusMax"
+    | "bodyMatch"
+    | "timeoutMs"
+    | "dailyBudget"
+    | "enabled"
+    | "tags"
+  >
+>;
+
+export type RegionConfigPatch = Partial<Pick<RegionConfig, "workerUrl" | "enabled" | "weight">>;

@@ -45,8 +45,10 @@ import type {
   Incident,
   LatestResult,
   MonitorConfig,
+  MonitorConfigPatch,
   MonitorMethod,
   RegionConfig,
+  RegionConfigPatch,
   StatusFilter,
   Summary,
   UsageSummary,
@@ -221,6 +223,39 @@ function App() {
     }
   }
 
+  async function saveMonitorConfig(id: string, patch: MonitorConfigPatch) {
+    setLoading(true);
+    try {
+      const body = await requestJson<{ monitor: MonitorConfig }>(`/api/monitors/${encodeURIComponent(id)}`, {
+        method: "PATCH",
+        body: JSON.stringify(patch)
+      });
+      setSelectedMonitorId(body.monitor.id);
+      await loadSummary();
+      showToast("success", "Monitor configuration saved.");
+    } catch (error) {
+      showToast("danger", error instanceof Error ? error.message : "Monitor update failed.");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function saveRegionConfig(id: string, patch: RegionConfigPatch) {
+    setLoading(true);
+    try {
+      await requestJson<{ region: RegionConfig }>(`/api/regions/${encodeURIComponent(id)}`, {
+        method: "PATCH",
+        body: JSON.stringify(patch)
+      });
+      await loadSummary();
+      showToast("success", "Region configuration saved.");
+    } catch (error) {
+      showToast("danger", error instanceof Error ? error.message : "Region update failed.");
+    } finally {
+      setLoading(false);
+    }
+  }
+
   async function runDueNow() {
     setLoading(true);
     try {
@@ -287,7 +322,9 @@ function App() {
             monitors={filteredMonitors}
             selectedMonitorId={selectedMonitorId}
             token={token}
+            loading={loading}
             onTokenSave={saveToken}
+            onRegionSave={saveRegionConfig}
             onMonitorSelect={(monitor) => {
               setSelectedMonitorId(monitor.id);
               setDetailTab("overview");
@@ -305,6 +342,7 @@ function App() {
         loading={loading}
         onTabChange={setDetailTab}
         onTokenSave={saveToken}
+        onMonitorSave={saveMonitorConfig}
         onFormChange={setForm}
         onCreate={createMonitor}
       />
@@ -511,7 +549,9 @@ function MainView({
   monitors,
   selectedMonitorId,
   token,
+  loading,
   onTokenSave,
+  onRegionSave,
   onMonitorSelect
 }: {
   view: ViewKey;
@@ -521,13 +561,15 @@ function MainView({
   monitors: MonitorConfig[];
   selectedMonitorId: string | null;
   token: string;
+  loading: boolean;
   onTokenSave: (value: string) => void | Promise<void>;
+  onRegionSave: (id: string, patch: RegionConfigPatch) => void | Promise<void>;
   onMonitorSelect: (monitor: MonitorConfig) => void;
 }) {
   if (view === "regions") return <RegionsView regions={summary.regions} />;
   if (view === "incidents") return <IncidentsView incidents={summary.incidents} />;
   if (view === "usage") return <UsageView summary={summary} health={health} />;
-  if (view === "placement") return <PlacementView regions={summary.regions} />;
+  if (view === "placement") return <PlacementView loading={loading} regions={summary.regions} onRegionSave={onRegionSave} />;
   if (view === "tokens") return <TokensView tokenSet={Boolean(token.trim())} onTokenSave={onTokenSave} />;
   return (
     <>
@@ -778,7 +820,15 @@ function UsageView({ summary, health }: { summary: Summary; health: HealthSummar
   );
 }
 
-function PlacementView({ regions }: { regions: RegionConfig[] }) {
+function PlacementView({
+  regions,
+  loading,
+  onRegionSave
+}: {
+  regions: RegionConfig[];
+  loading: boolean;
+  onRegionSave: (id: string, patch: RegionConfigPatch) => void | Promise<void>;
+}) {
   return (
     <Card className="data-card" variant="default">
       <Card.Header>
@@ -789,16 +839,83 @@ function PlacementView({ regions }: { regions: RegionConfig[] }) {
       </Card.Header>
       <Card.Content className="stack-list">
         {regions.map((region) => (
-          <Surface className="route-row" key={region.id}>
-            <div>
-              <strong>{region.workerName}</strong>
-              <span>{region.workerUrl || "worker_url missing"}</span>
-            </div>
-            <Chip size="sm" variant="soft">{region.placementRegion}</Chip>
-          </Surface>
+          <RegionRouteEditor key={region.id} loading={loading} region={region} onSave={onRegionSave} />
         ))}
       </Card.Content>
     </Card>
+  );
+}
+
+function RegionRouteEditor({
+  region,
+  loading,
+  onSave
+}: {
+  region: RegionConfig;
+  loading: boolean;
+  onSave: (id: string, patch: RegionConfigPatch) => void | Promise<void>;
+}) {
+  const [workerUrl, setWorkerUrl] = useState(region.workerUrl || "");
+  const [weight, setWeight] = useState(String(region.weight));
+  const [enabled, setEnabled] = useState(region.enabled);
+
+  useEffect(() => {
+    setWorkerUrl(region.workerUrl || "");
+    setWeight(String(region.weight));
+    setEnabled(region.enabled);
+  }, [region.id, region.workerUrl, region.weight, region.enabled]);
+
+  async function save(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    await onSave(region.id, {
+      workerUrl: workerUrl.trim() || null,
+      weight: Number.parseInt(weight, 10) || 1,
+      enabled
+    });
+  }
+
+  return (
+    <Surface className="route-row editable">
+      <form className="route-form" onSubmit={save}>
+        <div className="route-heading">
+          <div>
+            <strong>{region.workerName}</strong>
+            <span>{region.label} · {region.placementRegion}</span>
+          </div>
+          <Chip color={enabled ? "success" : "warning"} size="sm" variant="soft">
+            {enabled ? "enabled" : "paused"}
+          </Chip>
+        </div>
+        <Input
+          aria-label={`${region.label} Worker URL`}
+          fullWidth
+          onChange={(event) => setWorkerUrl(event.currentTarget.value)}
+          placeholder="https://<probe-worker>.workers.dev"
+          type="url"
+          value={workerUrl}
+          variant="secondary"
+        />
+        <div className="route-controls">
+          <label className="check-row">
+            <input checked={enabled} onChange={(event) => setEnabled(event.currentTarget.checked)} type="checkbox" />
+            Enabled
+          </label>
+          <Input
+            aria-label={`${region.label} weight`}
+            fullWidth
+            max={100}
+            min={1}
+            onChange={(event) => setWeight(event.currentTarget.value)}
+            type="number"
+            value={weight}
+            variant="secondary"
+          />
+          <Button className="primary-action" isDisabled={loading} size="sm" type="submit" variant="primary">
+            Save route
+          </Button>
+        </div>
+      </form>
+    </Surface>
   );
 }
 
@@ -911,6 +1028,7 @@ function Inspector({
   loading,
   onTabChange,
   onTokenSave,
+  onMonitorSave,
   onFormChange,
   onCreate
 }: {
@@ -923,6 +1041,7 @@ function Inspector({
   loading: boolean;
   onTabChange: (tab: DetailTab) => void;
   onTokenSave: (value: string) => void | Promise<void>;
+  onMonitorSave: (id: string, patch: MonitorConfigPatch) => void | Promise<void>;
   onFormChange: (form: { url: string; name: string; dailyBudget: string; method: MonitorMethod }) => void;
   onCreate: () => void;
 }) {
@@ -959,7 +1078,13 @@ function Inspector({
           <AlertsPanel incidents={summary.incidents.filter((incident) => incident.monitorId === monitor?.id)} />
         </Tabs.Panel>
         <Tabs.Panel id="settings">
-          <SettingsPanel monitor={monitor} tokenSet={Boolean(token.trim())} onTokenSave={onTokenSave} />
+          <SettingsPanel
+            loading={loading}
+            monitor={monitor}
+            tokenSet={Boolean(token.trim())}
+            onMonitorSave={onMonitorSave}
+            onTokenSave={onTokenSave}
+          />
         </Tabs.Panel>
       </Tabs>
       <AddMonitorForm form={form} loading={loading} onChange={onFormChange} onCreate={onCreate} />
@@ -1024,25 +1149,170 @@ function AlertsPanel({ incidents }: { incidents: Incident[] }) {
 
 function SettingsPanel({
   monitor,
+  loading,
   tokenSet,
+  onMonitorSave,
   onTokenSave
 }: {
   monitor: MonitorConfig | null;
+  loading: boolean;
   tokenSet: boolean;
+  onMonitorSave: (id: string, patch: MonitorConfigPatch) => void | Promise<void>;
   onTokenSave: (value: string) => void | Promise<void>;
 }) {
   return (
     <div className="settings-panel">
-      <TokenForm tokenSet={tokenSet} onTokenSave={onTokenSave} />
       {monitor ? (
-        <div className="detail-grid single">
-          <InfoItem label="Monitor ID" value={monitor.id} />
-          <InfoItem label="Created" value={relativeTime(monitor.createdAt)} />
-          <InfoItem label="Updated" value={relativeTime(monitor.updatedAt)} />
-          <InfoItem label="Enabled" value={monitor.enabled ? "yes" : "no"} />
-        </div>
+        <MonitorConfigForm loading={loading} monitor={monitor} onSave={onMonitorSave} />
       ) : null}
+      <div className="settings-meta">
+        <strong>Access token</strong>
+        <TokenForm tokenSet={tokenSet} onTokenSave={onTokenSave} />
+      </div>
     </div>
+  );
+}
+
+function MonitorConfigForm({
+  monitor,
+  loading,
+  onSave
+}: {
+  monitor: MonitorConfig;
+  loading: boolean;
+  onSave: (id: string, patch: MonitorConfigPatch) => void | Promise<void>;
+}) {
+  const [form, setForm] = useState(() => monitorToForm(monitor));
+
+  useEffect(() => {
+    setForm(monitorToForm(monitor));
+  }, [monitor.id, monitor.updatedAt]);
+
+  async function save(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    await onSave(monitor.id, {
+      name: form.name,
+      url: form.url,
+      method: form.method,
+      expectedStatusMin: Number.parseInt(form.expectedStatusMin, 10),
+      expectedStatusMax: Number.parseInt(form.expectedStatusMax, 10),
+      bodyMatch: form.bodyMatch.trim() || null,
+      timeoutMs: Number.parseInt(form.timeoutMs, 10),
+      dailyBudget: Number.parseInt(form.dailyBudget, 10),
+      enabled: form.enabled,
+      tags: splitTags(form.tags)
+    });
+  }
+
+  return (
+    <form className="monitor-config-form" onSubmit={save}>
+      <div className="config-section-title">
+        <strong>Monitor configuration</strong>
+        <Chip color={form.enabled ? "success" : "warning"} size="sm" variant="soft">
+          {form.enabled ? "enabled" : "paused"}
+        </Chip>
+      </div>
+      <label className="check-row">
+        <input
+          checked={form.enabled}
+          onChange={(event) => setForm({ ...form, enabled: event.currentTarget.checked })}
+          type="checkbox"
+        />
+        Enabled for scheduling
+      </label>
+      <Input
+        aria-label="Monitor name"
+        fullWidth
+        onChange={(event) => setForm({ ...form, name: event.currentTarget.value })}
+        placeholder="Example API"
+        value={form.name}
+        variant="secondary"
+      />
+      <Input
+        aria-label="Monitor URL"
+        fullWidth
+        onChange={(event) => setForm({ ...form, url: event.currentTarget.value })}
+        placeholder="https://example.com/health"
+        type="url"
+        value={form.url}
+        variant="secondary"
+      />
+      <div className="form-row">
+        <label className="method-select">
+          <span>Method</span>
+          <select
+            onChange={(event) => setForm({ ...form, method: event.currentTarget.value as MonitorMethod })}
+            value={form.method}
+          >
+            <option value="HEAD">HEAD</option>
+            <option value="GET">GET</option>
+          </select>
+        </label>
+        <Input
+          aria-label="Daily budget"
+          fullWidth
+          min={1}
+          onChange={(event) => setForm({ ...form, dailyBudget: event.currentTarget.value })}
+          type="number"
+          value={form.dailyBudget}
+          variant="secondary"
+        />
+      </div>
+      <div className="form-row">
+        <Input
+          aria-label="Expected status min"
+          fullWidth
+          max={599}
+          min={100}
+          onChange={(event) => setForm({ ...form, expectedStatusMin: event.currentTarget.value })}
+          type="number"
+          value={form.expectedStatusMin}
+          variant="secondary"
+        />
+        <Input
+          aria-label="Expected status max"
+          fullWidth
+          max={599}
+          min={100}
+          onChange={(event) => setForm({ ...form, expectedStatusMax: event.currentTarget.value })}
+          type="number"
+          value={form.expectedStatusMax}
+          variant="secondary"
+        />
+      </div>
+      <Input
+        aria-label="Timeout milliseconds"
+        fullWidth
+        max={60000}
+        min={1000}
+        onChange={(event) => setForm({ ...form, timeoutMs: event.currentTarget.value })}
+        type="number"
+        value={form.timeoutMs}
+        variant="secondary"
+      />
+      <textarea
+        aria-label="Body match"
+        className="textarea-control"
+        onChange={(event) => setForm({ ...form, bodyMatch: event.currentTarget.value })}
+        placeholder="Optional response text match for GET checks"
+        value={form.bodyMatch}
+      />
+      <Input
+        aria-label="Tags"
+        fullWidth
+        onChange={(event) => setForm({ ...form, tags: event.currentTarget.value })}
+        placeholder="production, api"
+        value={form.tags}
+        variant="secondary"
+      />
+      <div className="detail-grid single compact">
+        <InfoItem label="Monitor ID" value={monitor.id} />
+        <InfoItem label="Updated" value={relativeTime(monitor.updatedAt)} />
+      </div>
+      <Button className="primary-action" fullWidth isDisabled={loading} size="sm" type="submit" variant="primary">
+        Save configuration
+      </Button>
+    </form>
   );
 }
 
@@ -1166,7 +1436,7 @@ function computeHealth(summary: Summary, latestByMonitor: Map<string, LatestResu
   let up = 0;
   let down = 0;
   let idle = 0;
-  const totalBudget = summary.monitors.reduce((total, monitor) => total + monitor.dailyBudget, 0);
+  const totalBudget = summary.monitors.reduce((total, monitor) => total + (monitor.enabled ? monitor.dailyBudget : 0), 0);
   for (const monitor of summary.monitors) {
     const status = monitorStatus(latestByMonitor.get(monitor.id) || []);
     if (status === "up") up += 1;
@@ -1240,6 +1510,28 @@ function formatNumber(value: number) {
 
 function viewLabel(view: ViewKey) {
   return navItems.find((item) => item.key === view)?.label || "Overview";
+}
+
+function monitorToForm(monitor: MonitorConfig) {
+  return {
+    name: monitor.name,
+    url: monitor.url,
+    method: monitor.method,
+    expectedStatusMin: String(monitor.expectedStatusMin),
+    expectedStatusMax: String(monitor.expectedStatusMax),
+    bodyMatch: monitor.bodyMatch || "",
+    timeoutMs: String(monitor.timeoutMs),
+    dailyBudget: String(monitor.dailyBudget),
+    enabled: monitor.enabled,
+    tags: monitor.tags.join(", ")
+  };
+}
+
+function splitTags(value: string) {
+  return value
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean);
 }
 
 createRoot(document.getElementById("root")!).render(<App />);

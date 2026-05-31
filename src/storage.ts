@@ -12,6 +12,7 @@ import type {
 import {
   DEFAULT_EXPECTED_STATUS_MAX,
   DEFAULT_EXPECTED_STATUS_MIN,
+  MAX_BODY_MATCH_BYTES,
   DEFAULT_TIMEOUT_MS,
   boolFromDb,
   createId,
@@ -36,6 +37,25 @@ export interface CreateMonitorInput {
   timeoutMs?: number;
   dailyBudget?: number;
   tags?: string[];
+}
+
+export interface UpdateMonitorInput {
+  name?: string;
+  url?: string;
+  method?: MonitorMethod;
+  expectedStatusMin?: number;
+  expectedStatusMax?: number;
+  bodyMatch?: string | null;
+  timeoutMs?: number;
+  dailyBudget?: number;
+  enabled?: boolean;
+  tags?: string[];
+}
+
+export interface UpdateRegionInput {
+  workerUrl?: string | null;
+  enabled?: boolean;
+  weight?: number;
 }
 
 export async function bootstrapDefaults(env: RuntimeEnv): Promise<void> {
@@ -76,6 +96,7 @@ export async function createMonitor(env: RuntimeEnv, input: CreateMonitorInput):
   const name = input.name?.trim() || new URL(url).hostname;
   const expectedStatusMin = normalizeStatus(input.expectedStatusMin, DEFAULT_EXPECTED_STATUS_MIN);
   const expectedStatusMax = normalizeStatus(input.expectedStatusMax, DEFAULT_EXPECTED_STATUS_MAX);
+  validateStatusRange(expectedStatusMin, expectedStatusMax);
   const timeoutMs = clampInt(input.timeoutMs, 1000, 60_000, DEFAULT_TIMEOUT_MS);
   const dailyBudget = clampInt(
     input.dailyBudget,
@@ -84,6 +105,7 @@ export async function createMonitor(env: RuntimeEnv, input: CreateMonitorInput):
     parsePositiveInt(env.DEFAULT_DAILY_PROBE_BUDGET, 100)
   );
   const tags = input.tags?.filter((tag) => tag.trim().length > 0).map((tag) => tag.trim()) ?? [];
+  const bodyMatch = normalizeBodyMatch(input.bodyMatch);
 
   await env.DB.prepare(
     `INSERT INTO monitors (
@@ -98,7 +120,7 @@ export async function createMonitor(env: RuntimeEnv, input: CreateMonitorInput):
       method,
       expectedStatusMin,
       expectedStatusMax,
-      input.bodyMatch?.trim() || null,
+      bodyMatch,
       timeoutMs,
       dailyBudget,
       JSON.stringify(tags),
@@ -114,13 +136,131 @@ export async function createMonitor(env: RuntimeEnv, input: CreateMonitorInput):
     method,
     expectedStatusMin,
     expectedStatusMax,
-    bodyMatch: input.bodyMatch?.trim() || null,
+    bodyMatch,
     timeoutMs,
     dailyBudget,
     enabled: true,
     tags,
     createdAt: now,
     updatedAt: now
+  };
+}
+
+export async function updateMonitor(
+  env: RuntimeEnv,
+  id: string,
+  patch: UpdateMonitorInput
+): Promise<MonitorConfig> {
+  const existing = await env.DB.prepare("SELECT * FROM monitors WHERE id = ?").bind(id).first<DbRow>();
+  if (!existing) throw new Error("Monitor not found.");
+  const current = mapMonitor(existing);
+  const url = patch.url !== undefined ? normalizeHttpUrl(patch.url, env) : current.url;
+  const method = patch.method === "GET" ? "GET" : patch.method === "HEAD" ? "HEAD" : current.method;
+  const name = patch.name !== undefined ? patch.name.trim() || new URL(url).hostname : current.name;
+  const expectedStatusMin = normalizeStatus(patch.expectedStatusMin, current.expectedStatusMin);
+  const expectedStatusMax = normalizeStatus(patch.expectedStatusMax, current.expectedStatusMax);
+  validateStatusRange(expectedStatusMin, expectedStatusMax);
+  const timeoutMs = clampInt(patch.timeoutMs, 1000, 60_000, current.timeoutMs);
+  const dailyBudget = clampInt(
+    patch.dailyBudget,
+    1,
+    parsePositiveInt(env.MAX_MONITOR_DAILY_BUDGET, 10_000),
+    current.dailyBudget
+  );
+  const tags = patch.tags !== undefined ? normalizeTags(patch.tags) : current.tags;
+  const bodyMatch = patch.bodyMatch !== undefined ? normalizeBodyMatch(patch.bodyMatch) : current.bodyMatch;
+  const enabled = patch.enabled !== undefined ? patch.enabled : current.enabled;
+  const updatedAt = nowIso();
+
+  await env.DB.prepare(
+    `UPDATE monitors SET
+      name = ?,
+      url = ?,
+      method = ?,
+      expected_status_min = ?,
+      expected_status_max = ?,
+      body_match = ?,
+      timeout_ms = ?,
+      daily_budget = ?,
+      enabled = ?,
+      tags_json = ?,
+      updated_at = ?
+    WHERE id = ?`
+  )
+    .bind(
+      name,
+      url,
+      method,
+      expectedStatusMin,
+      expectedStatusMax,
+      bodyMatch,
+      timeoutMs,
+      dailyBudget,
+      enabled ? 1 : 0,
+      JSON.stringify(tags),
+      updatedAt,
+      id
+    )
+    .run();
+
+  const probeShapeChanged =
+    url !== current.url ||
+    method !== current.method ||
+    expectedStatusMin !== current.expectedStatusMin ||
+    expectedStatusMax !== current.expectedStatusMax ||
+    bodyMatch !== current.bodyMatch ||
+    enabled !== current.enabled;
+  if (probeShapeChanged) {
+    await resetMonitorRuntimeState(env, id, enabled ? "config_changed" : "monitor_disabled");
+  }
+
+  return {
+    id,
+    name,
+    url,
+    method,
+    expectedStatusMin,
+    expectedStatusMax,
+    bodyMatch,
+    timeoutMs,
+    dailyBudget,
+    enabled,
+    tags,
+    createdAt: current.createdAt,
+    updatedAt
+  };
+}
+
+export async function updateRegion(
+  env: RuntimeEnv,
+  id: string,
+  patch: UpdateRegionInput
+): Promise<RegionConfig> {
+  const existing = await env.DB.prepare("SELECT * FROM regions WHERE id = ?").bind(id).first<DbRow>();
+  if (!existing) throw new Error("Region not found.");
+  const current = mapRegion(existing);
+  const workerUrl = patch.workerUrl !== undefined ? normalizeWorkerUrl(patch.workerUrl) : current.workerUrl;
+  const enabled = patch.enabled !== undefined ? patch.enabled : current.enabled;
+  const weight = clampInt(patch.weight, 1, 100, current.weight);
+  const updatedAt = nowIso();
+
+  await env.DB.prepare(
+    `UPDATE regions SET
+      worker_url = ?,
+      enabled = ?,
+      weight = ?,
+      updated_at = ?
+    WHERE id = ?`
+  )
+    .bind(workerUrl, enabled ? 1 : 0, weight, updatedAt, id)
+    .run();
+
+  return {
+    ...current,
+    workerUrl,
+    enabled,
+    weight,
+    updatedAt
   };
 }
 
@@ -385,6 +525,20 @@ async function updateIncidents(env: RuntimeEnv, monitorIds: string[]): Promise<v
   }
 }
 
+async function resetMonitorRuntimeState(env: RuntimeEnv, monitorId: string, reason: string): Promise<void> {
+  const now = nowIso();
+  await env.DB.batch([
+    env.DB.prepare("DELETE FROM monitor_latest WHERE monitor_id = ?").bind(monitorId),
+    env.DB.prepare(
+      `UPDATE incidents SET
+        status = 'resolved',
+        closed_at = ?,
+        summary = ?
+      WHERE monitor_id = ? AND status = 'open'`
+    ).bind(now, `Resolved after ${reason.replaceAll("_", " ")}`, monitorId)
+  ]);
+}
+
 function writeAnalytics(env: RuntimeEnv, results: ProbeResult[]): void {
   if (!env.ANALYTICS) return;
   for (const result of results) {
@@ -501,6 +655,33 @@ function normalizeHttpUrl(input: string, env: RuntimeEnv): string {
   return url.toString();
 }
 
+function normalizeWorkerUrl(input: string | null): string | null {
+  const trimmed = input?.trim();
+  if (!trimmed) return null;
+  const url = new URL(trimmed);
+  if (url.protocol !== "http:" && url.protocol !== "https:") {
+    throw new Error("Worker URL must use http or https.");
+  }
+  if (url.username || url.password) {
+    throw new Error("Worker URL must not include embedded credentials.");
+  }
+  url.hash = "";
+  return url.toString();
+}
+
+function normalizeBodyMatch(value: string | null | undefined): string | null {
+  const trimmed = value?.trim();
+  if (!trimmed) return null;
+  if (new TextEncoder().encode(trimmed).length > MAX_BODY_MATCH_BYTES) {
+    throw new Error("bodyMatch is too large.");
+  }
+  return trimmed;
+}
+
+function normalizeTags(tags: string[]): string[] {
+  return [...new Set(tags.map((tag) => tag.trim()).filter(Boolean))].slice(0, 20);
+}
+
 function isBlockedTargetHostname(hostname: string): boolean {
   const normalized = hostname.toLowerCase().replace(/^\[/, "").replace(/\]$/, "");
   if (
@@ -546,6 +727,10 @@ function isBlockedIpv4(hostname: string): boolean {
 
 function normalizeStatus(value: number | undefined, fallback: number): number {
   return clampInt(value, 100, 599, fallback);
+}
+
+function validateStatusRange(min: number, max: number): void {
+  if (min > max) throw new Error("expectedStatusMin must be less than or equal to expectedStatusMax.");
 }
 
 function clampInt(value: number | undefined, min: number, max: number, fallback: number): number {

@@ -587,6 +587,11 @@ select {
   grid-template-columns: minmax(0, 1fr) auto;
 }
 
+.route-row.editable {
+  display: block;
+  padding: 0;
+}
+
 .route-row span {
   display: block;
   margin-top: 3px;
@@ -604,6 +609,26 @@ select {
 .route-row strong {
   display: block;
   color: #111817;
+}
+
+.route-form {
+  display: grid;
+  gap: 10px;
+  padding: 12px;
+}
+
+.route-heading {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: flex-start;
+}
+
+.route-controls {
+  display: grid;
+  grid-template-columns: 1fr 92px auto;
+  gap: 8px;
+  align-items: center;
 }
 
 .region-lead span {
@@ -888,6 +913,78 @@ select {
 .settings-panel {
   display: grid;
   gap: 12px;
+}
+
+.monitor-config-form {
+  display: grid;
+  gap: 10px;
+}
+
+.config-section-title,
+.settings-meta {
+  border: 1px solid #e3ebe9;
+  border-radius: 8px;
+  background: #fff;
+  padding: 10px;
+}
+
+.config-section-title {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+}
+
+.settings-meta {
+  display: grid;
+  gap: 10px;
+}
+
+.settings-meta > strong {
+  color: #111817;
+  font-size: 13px;
+}
+
+.check-row {
+  min-height: 38px;
+  border-radius: 8px;
+  border: 1px solid #dfe8e6;
+  background: #f8fbfa;
+  display: flex;
+  gap: 9px;
+  align-items: center;
+  padding: 0 10px;
+  color: #182321;
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.check-row input {
+  accent-color: #078f86;
+}
+
+.textarea-control {
+  width: 100%;
+  min-height: 82px;
+  resize: vertical;
+  border: 1px solid #dfe8e6;
+  border-radius: 8px;
+  background: #f8fbfa;
+  color: #182321;
+  font: inherit;
+  font-size: 13px;
+  line-height: 1.45;
+  outline: none;
+  padding: 10px;
+}
+
+.textarea-control:focus {
+  border-color: #18b7aa;
+  box-shadow: 0 0 0 3px rgba(24, 183, 170, 0.12);
+}
+
+.detail-grid.compact {
+  gap: 7px;
 }
 
 .create-card {

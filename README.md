@@ -108,6 +108,15 @@ PUBLIC_BASE_URL=http://localhost:8787
 
 Then create a monitor in the dashboard and click `Run Due Now`.
 
+## Runtime Configuration
+
+The dashboard can update D1-backed runtime configuration without redeploying:
+
+- Monitor settings: name, URL, method, expected status range, body match, timeout, daily budget, enabled state, and tags.
+- Region dispatch settings: `worker_url`, enabled state, and scheduling weight.
+
+Secrets and Worker environment variables are intentionally not editable from the dashboard. Keep `ADMIN_TOKEN`, `SHARED_SECRET`, and deployment bindings managed through Wrangler and `wrangler.jsonc`.
+
 ## Cloudflare Deployment
 
 Create resources:

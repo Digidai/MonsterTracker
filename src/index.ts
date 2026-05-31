@@ -13,7 +13,9 @@ import {
   listMonitors,
   listRegions,
   recordQueueMessages,
-  saveProbeResults
+  saveProbeResults,
+  updateMonitor,
+  updateRegion
 } from "./storage";
 
 export default {
@@ -82,6 +84,32 @@ async function handleControlRequest(
       return Response.json({ monitor }, { status: 201 });
     } catch (caught) {
       return jsonError(caught instanceof Error ? caught.message : "Invalid monitor input", 400);
+    }
+  }
+
+  const monitorMatch = /^\/api\/monitors\/([^/]+)$/.exec(url.pathname);
+  if (request.method === "PATCH" && monitorMatch?.[1]) {
+    const unauthorized = requireAdmin(request, env);
+    if (unauthorized) return unauthorized;
+    try {
+      const input = await request.json();
+      const monitor = await updateMonitor(env, decodeURIComponent(monitorMatch[1]), parseUpdateMonitorInput(input));
+      return Response.json({ monitor });
+    } catch (caught) {
+      return jsonError(caught instanceof Error ? caught.message : "Invalid monitor update", 400);
+    }
+  }
+
+  const regionMatch = /^\/api\/regions\/([^/]+)$/.exec(url.pathname);
+  if (request.method === "PATCH" && regionMatch?.[1]) {
+    const unauthorized = requireAdmin(request, env);
+    if (unauthorized) return unauthorized;
+    try {
+      const input = await request.json();
+      const region = await updateRegion(env, decodeURIComponent(regionMatch[1]), parseUpdateRegionInput(input));
+      return Response.json({ region });
+    } catch (caught) {
+      return jsonError(caught instanceof Error ? caught.message : "Invalid region update", 400);
     }
   }
 
@@ -335,14 +363,59 @@ function parseCreateMonitorInput(input: unknown) {
   return output;
 }
 
-function applyGlobalDailyCap<T extends { dailyBudget: number }>(monitors: T[], maxDailyProbes: number): T[] {
-  const enabledBudget = monitors.reduce((total, monitor) => total + Math.max(0, monitor.dailyBudget), 0);
+function parseUpdateMonitorInput(input: unknown) {
+  if (!input || typeof input !== "object") throw new Error("JSON body is required.");
+  const value = input as Record<string, unknown>;
+  const output: {
+    url?: string;
+    name?: string;
+    method?: "HEAD" | "GET";
+    expectedStatusMin?: number;
+    expectedStatusMax?: number;
+    bodyMatch?: string | null;
+    timeoutMs?: number;
+    dailyBudget?: number;
+    enabled?: boolean;
+    tags?: string[];
+  } = {};
+  if (typeof value.url === "string") output.url = value.url;
+  if (typeof value.name === "string") output.name = value.name;
+  if (value.method === "GET" || value.method === "HEAD") output.method = value.method;
+  if (typeof value.expectedStatusMin === "number") output.expectedStatusMin = value.expectedStatusMin;
+  if (typeof value.expectedStatusMax === "number") output.expectedStatusMax = value.expectedStatusMax;
+  if (typeof value.bodyMatch === "string" || value.bodyMatch === null) output.bodyMatch = value.bodyMatch;
+  if (typeof value.timeoutMs === "number") output.timeoutMs = value.timeoutMs;
+  if (typeof value.dailyBudget === "number") output.dailyBudget = value.dailyBudget;
+  if (typeof value.enabled === "boolean") output.enabled = value.enabled;
+  if (Array.isArray(value.tags)) output.tags = value.tags.filter((tag): tag is string => typeof tag === "string");
+  return output;
+}
+
+function parseUpdateRegionInput(input: unknown) {
+  if (!input || typeof input !== "object") throw new Error("JSON body is required.");
+  const value = input as Record<string, unknown>;
+  const output: {
+    workerUrl?: string | null;
+    enabled?: boolean;
+    weight?: number;
+  } = {};
+  if (typeof value.workerUrl === "string" || value.workerUrl === null) output.workerUrl = value.workerUrl;
+  if (typeof value.enabled === "boolean") output.enabled = value.enabled;
+  if (typeof value.weight === "number") output.weight = value.weight;
+  return output;
+}
+
+function applyGlobalDailyCap<T extends { dailyBudget: number; enabled?: boolean }>(monitors: T[], maxDailyProbes: number): T[] {
+  const enabledMonitors = monitors.filter((monitor) => monitor.enabled !== false);
+  const enabledBudget = enabledMonitors.reduce((total, monitor) => total + Math.max(0, monitor.dailyBudget), 0);
   if (enabledBudget <= maxDailyProbes) return monitors;
   let remaining = maxDailyProbes;
+  let remainingEnabled = enabledMonitors.length;
   return monitors.map((monitor, index) => {
-    const remainingMonitors = monitors.length - index;
+    if (monitor.enabled === false) return monitor;
+    remainingEnabled -= 1;
     const scaled = Math.max(1, Math.floor((monitor.dailyBudget / enabledBudget) * maxDailyProbes));
-    const capped = Math.min(scaled, Math.max(0, remaining - (remainingMonitors - 1)));
+    const capped = Math.min(scaled, Math.max(0, remaining - remainingEnabled));
     remaining -= capped;
     return { ...monitor, dailyBudget: capped };
   });
