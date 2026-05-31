@@ -1,0 +1,59 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "monstertracker-control",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-05-31",
+  "compatibility_flags": ["nodejs_compat", "global_fetch_strictly_public"],
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1
+  },
+  "vars": {
+    "ROLE": "control",
+    "APP_NAME": "MonsterTracker",
+    "REGION_PACK": "core",
+    "DEFAULT_DAILY_PROBE_BUDGET": "100",
+    "DEFAULT_RETENTION_DAYS": "30",
+    "PROBE_BATCH_SIZE": "50",
+    "MAX_DAILY_PROBES": "10000",
+    "MAX_MONITOR_DAILY_BUDGET": "10000",
+    "ALLOW_LOCAL_PROBES": "false"
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "monstertracker",
+      "database_id": "REPLACE_WITH_D1_DATABASE_ID"
+    }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "ARCHIVE",
+      "bucket_name": "monstertracker-archive"
+    }
+  ],
+  "analytics_engine_datasets": [
+    {
+      "binding": "ANALYTICS",
+      "dataset": "monstertracker_results"
+    }
+  ],
+  "queues": {
+    "producers": [
+      {
+        "binding": "RESULTS_QUEUE",
+        "queue": "monstertracker-results"
+      }
+    ],
+    "consumers": [
+      {
+        "queue": "monstertracker-results",
+        "max_batch_size": 1,
+        "max_batch_timeout": 5
+      }
+    ]
+  },
+  "triggers": {
+    "crons": ["* * * * *"]
+  }
+}

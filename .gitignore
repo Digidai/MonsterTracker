@@ -1,0 +1,13 @@
+node_modules/
+.wrangler/
+**/.wrangler/
+.playwright-cli/
+output/
+.dev.vars
+.env
+.env.*
+.DS_Store
+wrangler.deploy.jsonc
+generated/
+dist/
+coverage/
