@@ -2,7 +2,6 @@ import { requireAdmin, requireInternal } from "./auth";
 import { estimateCost } from "./cost";
 import type { ProbeJob, ProbeResult, RuntimeEnv } from "./domain";
 import { createId, nowIso, parsePositiveInt } from "./domain";
-import { renderDashboard } from "./html";
 import { type ProbeRequestPayload, runProbeJobs } from "./probe";
 import { buildSchedulePlan } from "./scheduler";
 import {
@@ -57,14 +56,6 @@ async function handleControlRequest(
   ctx: ExecutionContext,
   url: URL
 ): Promise<Response> {
-  if (request.method === "GET" && url.pathname === "/") {
-    return renderDashboard(env.APP_NAME ?? "MonsterTracker");
-  }
-
-  if (request.method === "GET" && url.pathname === "/favicon.ico") {
-    return new Response(null, { status: 204, headers: { "Cache-Control": "public, max-age=86400" } });
-  }
-
   if (request.method === "GET" && url.pathname === "/health") {
     return Response.json({ ok: true, role: env.ROLE ?? "control", time: nowIso() });
   }
@@ -114,6 +105,11 @@ async function handleControlRequest(
       dispatchedJobs: results.length,
       queued: Boolean(env.RESULTS_QUEUE)
     });
+  }
+
+  if (request.method === "GET" && !url.pathname.startsWith("/api/")) {
+    if (env.ASSETS) return env.ASSETS.fetch(request);
+    return jsonError("Dashboard assets are not configured.", 503);
   }
 
   return jsonError("Not found", 404);

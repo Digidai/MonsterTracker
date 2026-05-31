@@ -129,6 +129,7 @@ export type RuntimeEnv = Omit<
   Env,
   "ROLE" | "REGION_PACK" | "DEFAULT_DAILY_PROBE_BUDGET" | "DEFAULT_RETENTION_DAYS" | "PROBE_BATCH_SIZE" | "ALLOW_LOCAL_PROBES"
 > & {
+  ASSETS?: { fetch: (request: Request) => Promise<Response> };
   ADMIN_TOKEN?: string;
   SHARED_SECRET?: string;
   PUBLIC_BASE_URL?: string;

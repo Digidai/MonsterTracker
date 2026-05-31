@@ -86,10 +86,14 @@ curl "http://localhost:8787/api/cost?urls=10&probesPerDay=10000&queueBatchSize=5
 npm install
 npm run types
 npm run db:migrate:local
-npx wrangler dev --test-scheduled --port 8787 \
-  --var ADMIN_TOKEN:dev-admin-token \
-  --var SHARED_SECRET:dev-shared-secret \
-  --var ALLOW_LOCAL_PROBES:true
+```
+
+The dashboard is a Vite React app built with HeroUI components. `npm run dev`
+builds the dashboard assets first and then starts Wrangler with the static
+assets binding:
+
+```bash
+npm run dev
 ```
 
 Open `http://localhost:8787`.

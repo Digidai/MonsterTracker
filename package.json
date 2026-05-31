@@ -6,21 +6,36 @@
   "private": false,
   "license": "MIT",
   "scripts": {
-    "dev": "wrangler dev --test-scheduled",
-    "deploy": "wrangler deploy",
-    "deploy:dry-run": "wrangler deploy --dry-run",
+    "build": "vite build",
+    "client:dev": "vite --host 127.0.0.1",
+    "dev": "npm run build && wrangler dev --test-scheduled",
+    "deploy": "npm run build && wrangler deploy",
+    "deploy:dry-run": "npm run build && wrangler deploy --dry-run",
     "db:migrate:local": "wrangler d1 migrations apply monstertracker --local",
     "db:migrate:remote": "wrangler d1 migrations apply monstertracker --remote",
     "generate:probes": "node scripts/generate-probe-configs.mjs",
     "list:placement-regions": "node scripts/list-supported-regions.mjs",
     "types": "wrangler types ./worker-configuration.d.ts",
-    "check": "tsc --noEmit && vitest run",
+    "check": "tsc --noEmit && vitest run && npm run build",
     "test": "vitest run"
   },
   "devDependencies": {
+    "@tailwindcss/vite": "^4.3.0",
     "@types/node": "^25.9.1",
+    "@types/react": "^19.2.15",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^6.0.2",
+    "tailwindcss": "^4.3.0",
     "typescript": "latest",
+    "vite": "^8.0.14",
     "vitest": "latest",
     "wrangler": "latest"
+  },
+  "dependencies": {
+    "@heroui/react": "^3.1.0",
+    "clsx": "^2.1.1",
+    "lucide-react": "^1.17.0",
+    "react": "^19.2.6",
+    "react-dom": "^19.2.6"
   }
 }
