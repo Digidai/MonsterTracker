@@ -49,6 +49,7 @@ function html(appName: string, nonce = ""): string {
       font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
     }
     * { box-sizing: border-box; }
+    [hidden] { display: none !important; }
     body {
       margin: 0;
       background: var(--bg);
@@ -256,6 +257,56 @@ function html(appName: string, nonce = ""): string {
       min-height: 0;
       overflow: auto;
     }
+    .view-panel {
+      min-height: 0;
+      overflow: auto;
+      padding: 24px;
+    }
+    .view-panel[hidden] { display: none; }
+    .metric-grid {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 12px;
+    }
+    .metric {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fff;
+      padding: 14px;
+      display: grid;
+      gap: 5px;
+    }
+    .metric span {
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 700;
+    }
+    .metric strong {
+      font-size: 22px;
+      letter-spacing: 0;
+    }
+    .panel-list {
+      display: grid;
+      gap: 10px;
+    }
+    .panel-row {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fff;
+      padding: 12px;
+      display: grid;
+      gap: 6px;
+    }
+    .panel-row strong {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+    }
+    .panel-row span {
+      color: var(--muted);
+      font-size: 12px;
+      overflow-wrap: anywhere;
+    }
     table {
       width: 100%;
       border-collapse: collapse;
@@ -282,6 +333,7 @@ function html(appName: string, nonce = ""): string {
       background: #f0faf8;
       box-shadow: inset 3px 0 0 var(--teal);
     }
+    tr[data-monitor] { cursor: pointer; }
     .monitor-name {
       display: grid;
       gap: 2px;
@@ -396,6 +448,10 @@ function html(appName: string, nonce = ""): string {
       display: grid;
       gap: 22px;
     }
+    .detail-panel {
+      display: grid;
+      gap: 18px;
+    }
     .kv {
       display: grid;
       grid-template-columns: 1fr 1fr;
@@ -507,6 +563,7 @@ function html(appName: string, nonce = ""): string {
       .topbar, .filters { padding: 16px; align-items: flex-start; flex-direction: column; }
       .toolbar { justify-content: flex-start; }
       .table-wrap { overflow-x: auto; }
+      .metric-grid { grid-template-columns: 1fr 1fr; }
     }
   </style>
 </head>
@@ -525,14 +582,14 @@ function html(appName: string, nonce = ""): string {
         <span>Worker control plane</span>
       </div>
       <nav>
-        <button class="nav-item active"><span>Overview</span><span class="pill" id="navMonitors">0</span></button>
-        <button class="nav-item"><span>Regions</span><span class="pill" id="navRegions">0</span></button>
-        <button class="nav-item"><span>Incidents</span><span class="pill" id="navIncidents">0</span></button>
-        <button class="nav-item"><span>Usage</span></button>
+        <button class="nav-item active" data-view="overview"><span>Overview</span><span class="pill" id="navMonitors">0</span></button>
+        <button class="nav-item" data-view="regions"><span>Regions</span><span class="pill" id="navRegions">0</span></button>
+        <button class="nav-item" data-view="incidents"><span>Incidents</span><span class="pill" id="navIncidents">0</span></button>
+        <button class="nav-item" data-view="usage"><span>Usage</span></button>
         <div class="nav-label">Configuration</div>
-        <button class="nav-item"><span>Monitors</span></button>
-        <button class="nav-item"><span>Placement</span></button>
-        <button class="nav-item"><span>Tokens</span></button>
+        <button class="nav-item" data-view="monitors"><span>Monitors</span></button>
+        <button class="nav-item" data-view="placement"><span>Placement</span></button>
+        <button class="nav-item" data-view="tokens"><span>Tokens</span></button>
       </nav>
       <div class="sidebar-foot">
         <strong>Plan: Cloudflare Free</strong>
@@ -545,8 +602,8 @@ function html(appName: string, nonce = ""): string {
         <div class="title">
           <svg class="pulse" viewBox="0 0 32 32" aria-hidden="true"><path d="M2 17h6l4-10 6 20 4-10h8" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
           <div>
-            <h1>Monitors</h1>
-            <div class="subtitle"><span id="monitorCount">0</span> monitors across <span id="regionCount">0</span> placed regions</div>
+            <h1 id="pageTitle">Monitors</h1>
+            <div class="subtitle" id="pageSubtitle"><span id="monitorCount">0</span> monitors across <span id="regionCount">0</span> placed regions</div>
           </div>
         </div>
         <div class="toolbar">
@@ -559,7 +616,7 @@ function html(appName: string, nonce = ""): string {
           <button class="btn primary" id="runBtn" type="button">Run Due Now</button>
         </div>
       </header>
-      <section class="filters">
+      <section class="filters" id="filters">
         <div class="search"><input id="search" type="search" placeholder="Search monitors..."></div>
         <select class="control" id="statusFilter">
           <option value="all">All status</option>
@@ -567,7 +624,7 @@ function html(appName: string, nonce = ""): string {
           <option value="down">Down</option>
         </select>
       </section>
-      <div class="table-wrap">
+      <div class="table-wrap" id="monitorTableWrap">
         <table>
           <thead>
             <tr>
@@ -582,6 +639,7 @@ function html(appName: string, nonce = ""): string {
           <tbody id="monitorRows"></tbody>
         </table>
       </div>
+      <div class="view-panel" id="mainPanel" hidden></div>
     </main>
     <aside class="detail">
       <div class="detail-head">
@@ -591,27 +649,14 @@ function html(appName: string, nonce = ""): string {
         </div>
         <div class="muted" id="detailUrl">Create a monitor to start collecting edge data.</div>
         <div class="tabs">
-          <button class="tab active">Overview</button>
-          <button class="tab">Regions</button>
-          <button class="tab">Alerts</button>
-          <button class="tab">Settings</button>
+          <button class="tab active" data-detail-tab="overview">Overview</button>
+          <button class="tab" data-detail-tab="regions">Regions</button>
+          <button class="tab" data-detail-tab="alerts">Alerts</button>
+          <button class="tab" data-detail-tab="settings">Settings</button>
         </div>
       </div>
       <div class="detail-body">
-        <section>
-          <div class="kv" id="detailKv"></div>
-        </section>
-        <section>
-          <div class="section-title">
-            <span>Global Region Coverage</span>
-            <span id="coverageText" style="color:var(--teal)">0 / 0</span>
-          </div>
-          <div class="region-grid" id="regionGrid"></div>
-        </section>
-        <section>
-          <div class="section-title"><span>Incident Timeline</span></div>
-          <div class="timeline" id="timeline"></div>
-        </section>
+        <div class="detail-panel" id="detailPanel"></div>
         <form class="form" id="addForm">
           <div class="section-title"><span>Add Monitor</span></div>
           <input type="text" autocomplete="username" value="admin" hidden>
@@ -629,19 +674,49 @@ function html(appName: string, nonce = ""): string {
   </div>
   <div class="toast" id="toast"></div>
   <script nonce="${nonce}">
-    const state = { summary: null, selected: null };
+    const state = {
+      summary: null,
+      selected: null,
+      view: sessionStorage.getItem('monstertracker.view') || 'overview',
+      detailTab: sessionStorage.getItem('monstertracker.detailTab') || 'overview'
+    };
     const tokenInput = document.getElementById('adminToken');
     tokenInput.value = sessionStorage.getItem('monstertracker.adminToken') || '';
     tokenInput.addEventListener('input', () => sessionStorage.setItem('monstertracker.adminToken', tokenInput.value));
 
     document.getElementById('refreshBtn').addEventListener('click', loadSummary);
     document.getElementById('runBtn').addEventListener('click', runDueNow);
+    document.querySelectorAll('[data-view]').forEach((button) => {
+      button.addEventListener('click', () => setView(button.getAttribute('data-view')));
+    });
+    document.querySelectorAll('[data-detail-tab]').forEach((button) => {
+      button.addEventListener('click', () => setDetailTab(button.getAttribute('data-detail-tab')));
+    });
     document.getElementById('addForm').addEventListener('submit', (event) => {
       event.preventDefault();
       addMonitor();
     });
     document.getElementById('search').addEventListener('input', render);
     document.getElementById('statusFilter').addEventListener('change', render);
+
+    function setView(view) {
+      if (!view) return;
+      state.view = view;
+      sessionStorage.setItem('monstertracker.view', view);
+      if (view === 'regions' || view === 'placement') state.detailTab = 'regions';
+      if (view === 'incidents') state.detailTab = 'alerts';
+      if (view === 'tokens' || view === 'monitors') state.detailTab = 'settings';
+      sessionStorage.setItem('monstertracker.detailTab', state.detailTab);
+      render();
+      if (view === 'tokens') tokenInput.focus();
+    }
+
+    function setDetailTab(tab) {
+      if (!tab) return;
+      state.detailTab = tab;
+      sessionStorage.setItem('monstertracker.detailTab', tab);
+      render();
+    }
 
     async function loadSummary() {
       const token = tokenInput.value.trim();
@@ -701,13 +776,38 @@ function html(appName: string, nonce = ""): string {
     function render() {
       const summary = state.summary;
       if (!summary) return;
-      const monitors = filteredMonitors(summary);
       const latestByMonitor = groupLatest(summary.latest);
-      document.getElementById('monitorCount').textContent = summary.monitors.length;
-      document.getElementById('regionCount').textContent = summary.regions.length;
+      renderNavigation(summary);
+      renderTopbar(summary);
+      renderMainView(summary, latestByMonitor);
+      renderDetail(summary, latestByMonitor);
+    }
+
+    function renderNavigation(summary) {
+      document.querySelectorAll('[data-view]').forEach((button) => {
+        button.classList.toggle('active', button.getAttribute('data-view') === state.view);
+      });
       document.getElementById('navMonitors').textContent = summary.monitors.length;
       document.getElementById('navRegions').textContent = summary.regions.filter(r => r.enabled).length;
       document.getElementById('navIncidents').textContent = summary.incidents.length;
+      document.querySelectorAll('[data-detail-tab]').forEach((button) => {
+        button.classList.toggle('active', button.getAttribute('data-detail-tab') === state.detailTab);
+      });
+    }
+
+    function renderTopbar(summary) {
+      const titles = {
+        overview: ['Monitors', summary.monitors.length + ' monitors across ' + summary.regions.length + ' placed regions'],
+        regions: ['Regions', summary.regions.filter(r => r.enabled).length + ' enabled probe regions'],
+        incidents: ['Incidents', summary.incidents.length + ' tracked incident records'],
+        usage: ['Usage', summary.usage.probeResults + ' probe results recorded today'],
+        monitors: ['Monitor Config', summary.monitors.length + ' configured monitors'],
+        placement: ['Placement', summary.regions.length + ' Cloudflare placement hints'],
+        tokens: ['Tokens', tokenInput.value.trim() ? 'Admin token is present in this tab' : 'Admin token is not set in this tab']
+      };
+      const item = titles[state.view] || titles.overview;
+      document.getElementById('pageTitle').textContent = item[0];
+      document.getElementById('pageSubtitle').textContent = item[1];
 
       const todayBudget = summary.monitors.reduce((total, monitor) => total + monitor.dailyBudget, 0);
       const used = summary.usage.probeResults;
@@ -715,7 +815,30 @@ function html(appName: string, nonce = ""): string {
       document.getElementById('budgetBar').style.width = pct + '%';
       document.getElementById('budgetPct').textContent = pct + '%';
       document.getElementById('freeFit').textContent = used <= 100000 ? 'Fits Free daily quotas' : 'Workers Paid recommended';
+    }
 
+    function renderMainView(summary, latestByMonitor) {
+      const tableWrap = document.getElementById('monitorTableWrap');
+      const filters = document.getElementById('filters');
+      const panel = document.getElementById('mainPanel');
+      const showMonitorTable = state.view === 'overview' || state.view === 'monitors';
+      tableWrap.hidden = !showMonitorTable;
+      filters.hidden = !showMonitorTable;
+      panel.hidden = showMonitorTable;
+      if (showMonitorTable) {
+        renderMonitorTable(summary, latestByMonitor);
+        return;
+      }
+      if (state.view === 'regions') panel.innerHTML = renderRegionsView(summary);
+      else if (state.view === 'incidents') panel.innerHTML = renderIncidentsView(summary);
+      else if (state.view === 'usage') panel.innerHTML = renderUsageView(summary);
+      else if (state.view === 'placement') panel.innerHTML = renderPlacementView(summary);
+      else if (state.view === 'tokens') panel.innerHTML = renderTokensView();
+      else panel.innerHTML = '';
+    }
+
+    function renderMonitorTable(summary, latestByMonitor) {
+      const monitors = filteredMonitors(summary);
       const rows = document.getElementById('monitorRows');
       rows.innerHTML = monitors.map((monitor) => rowHtml(monitor, latestByMonitor.get(monitor.id) || [], summary.regions.length)).join('');
       rows.querySelectorAll('tr[data-monitor]').forEach((row) => {
@@ -724,7 +847,60 @@ function html(appName: string, nonce = ""): string {
           render();
         });
       });
-      renderDetail(summary, latestByMonitor);
+    }
+
+    function renderRegionsView(summary) {
+      const rows = summary.regions.map((region) => {
+        const status = region.enabled ? 'up' : 'warn';
+        return '<tr>' +
+          '<td><span class="dot ' + status + '"></span></td>' +
+          '<td><strong>' + esc(region.label) + '</strong><div class="muted">' + esc(region.area) + '</div></td>' +
+          '<td>' + esc(region.id.toUpperCase()) + '</td>' +
+          '<td>' + esc(region.provider + ':' + region.providerRegion) + '</td>' +
+          '<td>' + esc(region.placementRegion) + '</td>' +
+          '<td>' + esc(region.lastSeenAt ? relativeTime(region.lastSeenAt) : 'never') + '</td>' +
+        '</tr>';
+      }).join('');
+      return '<div class="table-wrap"><table><thead><tr><th>Status</th><th>Region</th><th>ID</th><th>Provider</th><th>Placement</th><th>Last Seen</th></tr></thead><tbody>' + rows + '</tbody></table></div>';
+    }
+
+    function renderIncidentsView(summary) {
+      if (!summary.incidents.length) {
+        return '<div class="panel-list"><div class="panel-row"><strong>No open incidents<span>OK</span></strong><span>Current probe results do not show an incident record.</span></div></div>';
+      }
+      return '<div class="panel-list">' + summary.incidents.map((incident) =>
+        '<div class="panel-row"><strong>' + esc(incident.severity) + '<span>' + esc(incident.status) + '</span></strong><span>' + esc(incident.summary) + '</span><span>' + esc(relativeTime(incident.openedAt)) + '</span></div>'
+      ).join('') + '</div>';
+    }
+
+    function renderUsageView(summary) {
+      const totalBudget = summary.monitors.reduce((total, monitor) => total + monitor.dailyBudget, 0);
+      return '<div class="metric-grid">' +
+        metric('Probe Results', summary.usage.probeResults) +
+        metric('Daily Budget', totalBudget) +
+        metric('Queue Messages', summary.usage.queueMessages) +
+        metric('D1 Writes', summary.usage.d1Writes) +
+        metric('Worker Invocations', summary.usage.workerInvocations) +
+        metric('Monitors', summary.monitors.length) +
+        metric('Regions', summary.regions.filter((region) => region.enabled).length) +
+        metric('Free Quota Fit', summary.usage.probeResults <= 100000 ? 'Yes' : 'No') +
+      '</div>';
+    }
+
+    function renderPlacementView(summary) {
+      return '<div class="panel-list">' + summary.regions.map((region) => {
+        return '<div class="panel-row"><strong>' + esc(region.label) + '<span>' + esc(region.id.toUpperCase()) + '</span></strong><span>' + esc(region.placementRegion) + '</span><span>' + esc(region.workerUrl || 'worker_url not configured') + '</span></div>';
+      }).join('') + '</div>';
+    }
+
+    function renderTokensView() {
+      const tokenSet = tokenInput.value.trim().length > 0;
+      return '<div class="metric-grid">' +
+        metric('Admin Token', tokenSet ? 'Set' : 'Missing') +
+        metric('Storage', 'Session') +
+        metric('API Auth', tokenSet ? 'Ready' : 'Locked') +
+        metric('Dashboard', tokenSet ? 'Writable' : 'Read blocked') +
+      '</div>';
     }
 
     function filteredMonitors(summary) {
@@ -760,15 +936,14 @@ function html(appName: string, nonce = ""): string {
 
     function renderDetail(summary, latestByMonitor) {
       const monitor = summary.monitors.find((item) => item.id === state.selected) || summary.monitors[0];
-      const grid = document.getElementById('regionGrid');
-      const timeline = document.getElementById('timeline');
+      const panel = document.getElementById('detailPanel');
       if (!monitor) {
         document.getElementById('detailName').textContent = 'No monitor';
         document.getElementById('detailStatus').textContent = 'Idle';
         document.getElementById('detailUrl').textContent = 'Create a monitor to start collecting edge data.';
-        document.getElementById('detailKv').innerHTML = '';
-        grid.innerHTML = summary.regions.slice(0, 32).map((region) => '<div class="region-chip"><span class="dot warn"></span>' + esc(region.id.toUpperCase()) + '</div>').join('');
-        timeline.innerHTML = '<div class="notice">No incidents yet.</div>';
+        panel.innerHTML = state.detailTab === 'regions'
+          ? detailRegions(summary.regions, [], [])
+          : '<div class="notice">No monitor selected.</div>';
         return;
       }
       const latest = latestByMonitor.get(monitor.id) || [];
@@ -778,16 +953,51 @@ function html(appName: string, nonce = ""): string {
       const badge = document.getElementById('detailStatus');
       badge.textContent = failing.length ? 'Down' : latest.length ? 'Up' : 'Idle';
       badge.className = 'badge ' + (failing.length ? 'down' : '');
-      document.getElementById('coverageText').textContent = latest.length + ' / ' + summary.regions.length;
-      document.getElementById('detailKv').innerHTML = kv('Status', badge.textContent) + kv('Method', monitor.method) + kv('Last Check', latest[0] ? relativeTime(latest[0].checkedAt) : 'never') + kv('Timeout', monitor.timeoutMs + ' ms') + kv('Daily Budget', monitor.dailyBudget) + kv('Expected', monitor.expectedStatusMin + '-' + monitor.expectedStatusMax);
       const latestRegionIds = new Set(latest.map((item) => item.regionId));
       const failingRegionIds = new Set(failing.map((item) => item.regionId));
-      grid.innerHTML = summary.regions.slice(0, 48).map((region) => {
-        const cls = failingRegionIds.has(region.id) ? 'down' : latestRegionIds.has(region.id) ? 'up' : 'warn';
+      const incidents = summary.incidents.filter((incident) => incident.monitorId === monitor.id);
+      if (state.detailTab === 'regions') {
+        panel.innerHTML = detailRegions(summary.regions, latestRegionIds, failingRegionIds, latest.length + ' / ' + summary.regions.length);
+      } else if (state.detailTab === 'alerts') {
+        panel.innerHTML = detailAlerts(incidents);
+      } else if (state.detailTab === 'settings') {
+        panel.innerHTML = '<section><div class="kv">' +
+          kv('Monitor ID', monitor.id) +
+          kv('Enabled', monitor.enabled ? 'yes' : 'no') +
+          kv('Created', relativeTime(monitor.createdAt)) +
+          kv('Updated', relativeTime(monitor.updatedAt)) +
+          kv('Tags', monitor.tags.length ? monitor.tags.join(', ') : '-') +
+          kv('Target', monitor.url) +
+        '</div></section>';
+      } else {
+        panel.innerHTML = '<section><div class="kv">' +
+          kv('Status', badge.textContent) +
+          kv('Method', monitor.method) +
+          kv('Last Check', latest[0] ? relativeTime(latest[0].checkedAt) : 'never') +
+          kv('Timeout', monitor.timeoutMs + ' ms') +
+          kv('Daily Budget', monitor.dailyBudget) +
+          kv('Expected', monitor.expectedStatusMin + '-' + monitor.expectedStatusMax) +
+        '</div></section>';
+      }
+    }
+
+    function detailRegions(regions, latestRegionIds, failingRegionIds, coverage) {
+      const seen = latestRegionIds instanceof Set ? latestRegionIds : new Set(latestRegionIds || []);
+      const failing = failingRegionIds instanceof Set ? failingRegionIds : new Set(failingRegionIds || []);
+      const chips = regions.slice(0, 48).map((region) => {
+        const cls = failing.has(region.id) ? 'down' : seen.has(region.id) ? 'up' : 'warn';
         return '<div class="region-chip"><span class="dot ' + cls + '"></span>' + esc(region.id.toUpperCase()) + '</div>';
       }).join('');
-      const incidents = summary.incidents.filter((incident) => incident.monitorId === monitor.id);
-      timeline.innerHTML = incidents.length ? incidents.map((incident) => '<div class="event"><div class="event-icon">!</div><div><strong>' + esc(incident.severity) + '</strong><span>' + esc(incident.summary) + ' / ' + relativeTime(incident.openedAt) + '</span></div></div>').join('') : '<div class="event"><div class="event-icon">OK</div><div><strong>No open incidents</strong><span>Latest region results look healthy.</span></div></div>';
+      return '<section><div class="section-title"><span>Global Region Coverage</span><span style="color:var(--teal)">' + esc(coverage || '0 / ' + regions.length) + '</span></div><div class="region-grid">' + chips + '</div></section>';
+    }
+
+    function detailAlerts(incidents) {
+      if (!incidents.length) {
+        return '<section><div class="timeline"><div class="event"><div class="event-icon">OK</div><div><strong>No open incidents</strong><span>Latest region results look healthy.</span></div></div></div></section>';
+      }
+      return '<section><div class="timeline">' + incidents.map((incident) =>
+        '<div class="event"><div class="event-icon">!</div><div><strong>' + esc(incident.severity) + '</strong><span>' + esc(incident.summary) + ' / ' + relativeTime(incident.openedAt) + '</span></div></div>'
+      ).join('') + '</div></section>';
     }
 
     function groupLatest(items) {
@@ -800,6 +1010,7 @@ function html(appName: string, nonce = ""): string {
       }
       return map;
     }
+    function metric(label, value) { return '<div class="metric"><span>' + esc(label) + '</span><strong>' + esc(String(value)) + '</strong></div>'; }
     function kv(label, value) { return '<div><span>' + esc(label) + '</span><strong>' + esc(String(value)) + '</strong></div>'; }
     function median(values) {
       if (!values.length) return null;
