@@ -55,6 +55,18 @@ import type {
   ViewKey
 } from "./types";
 
+interface MonitorDraft {
+  url: string;
+  name: string;
+  dailyBudget: string;
+  method: MonitorMethod;
+  expectedStatusMin: string;
+  expectedStatusMax: string;
+  timeoutMs: string;
+  bodyMatch: string;
+  tags: string;
+}
+
 const navItems: Array<{ key: ViewKey; label: string; icon: typeof Activity }> = [
   { key: "overview", label: "Overview", icon: Activity },
   { key: "monitors", label: "Monitors", icon: Server },
@@ -78,6 +90,7 @@ const emptySummary: Summary = {
   regions: [],
   latest: [],
   incidents: [],
+  runs: [],
   usage: {
     date: "",
     probeResults: 0,
@@ -85,6 +98,18 @@ const emptySummary: Summary = {
     queueMessages: 0,
     d1Writes: 0
   }
+};
+
+const defaultMonitorDraft: MonitorDraft = {
+  url: "",
+  name: "",
+  dailyBudget: "100",
+  method: "HEAD",
+  expectedStatusMin: "200",
+  expectedStatusMax: "399",
+  timeoutMs: "10000",
+  bodyMatch: "",
+  tags: ""
 };
 
 function App() {
@@ -99,12 +124,7 @@ function App() {
   const [statusFilter, setStatusFilter] = useState<StatusFilter>("all");
   const [loading, setLoading] = useState(false);
   const [toast, setToast] = useState<{ tone: "success" | "danger" | "info"; message: string } | null>(null);
-  const [form, setForm] = useState({
-    url: "",
-    name: "",
-    dailyBudget: "100",
-    method: "HEAD" as MonitorMethod
-  });
+  const [form, setForm] = useState<MonitorDraft>(defaultMonitorDraft);
 
   useEffect(() => {
     sessionStorage.setItem("monstertracker.adminToken", token);
@@ -199,21 +219,21 @@ function App() {
       showToast("danger", "URL is required.");
       return;
     }
+    const parsed = parseMonitorForm(form);
+    if (!parsed.ok) {
+      showToast("danger", parsed.error);
+      return;
+    }
     setLoading(true);
     try {
       const body = await requestJson<{ monitor: MonitorConfig }>("/api/monitors", {
         method: "POST",
-        body: JSON.stringify({
-          url: form.url.trim(),
-          name: form.name.trim(),
-          dailyBudget: Number.parseInt(form.dailyBudget, 10) || 100,
-          method: form.method
-        })
+        body: JSON.stringify(parsed.patch)
       });
       setSelectedMonitorId(body.monitor.id);
       setView("overview");
       setDetailTab("overview");
-      setForm({ url: "", name: "", dailyBudget: "100", method: "HEAD" });
+      setForm(defaultMonitorDraft);
       await loadSummary();
       showToast("success", "Monitor created.");
     } catch (error) {
@@ -272,11 +292,45 @@ function App() {
     }
   }
 
+  async function runMonitorSample(monitorId: string) {
+    setLoading(true);
+    try {
+      const body = await requestJson<{ plannedJobs: number; dispatchedJobs: number; queued: boolean }>("/api/run", {
+        method: "POST",
+        body: JSON.stringify({ mode: "sample", monitorId })
+      });
+      showToast("success", `Sampled ${body.dispatchedJobs} region job${body.dispatchedJobs === 1 ? "" : "s"}.`);
+      window.setTimeout(() => void loadSummary(), body.queued ? 900 : 100);
+    } catch (error) {
+      showToast("danger", error instanceof Error ? error.message : "Sample run failed.");
+    } finally {
+      setLoading(false);
+    }
+  }
+
   function selectView(next: ViewKey) {
     setView(next);
     if (next === "regions" || next === "placement") setDetailTab("regions");
     if (next === "incidents") setDetailTab("alerts");
     if (next === "tokens" || next === "monitors") setDetailTab("settings");
+  }
+
+  function openAddMonitor() {
+    if (!token.trim()) {
+      setView("tokens");
+      showToast("danger", "Admin token is required before creating monitors.");
+      return;
+    }
+    setView("monitors");
+    setDetailTab("settings");
+    focusInspectorOnCompact();
+  }
+
+  function focusInspectorOnCompact() {
+    if (!window.matchMedia("(max-width: 1240px)").matches) return;
+    window.setTimeout(() => {
+      document.querySelector<HTMLElement>(".inspector")?.scrollIntoView({ behavior: "smooth", block: "start" });
+    }, 0);
   }
 
   function showToast(tone: "success" | "danger" | "info", message: string) {
@@ -308,10 +362,8 @@ function App() {
           statusFilter={statusFilter}
           onQueryChange={setQuery}
           onFilterChange={setStatusFilter}
-          onAdd={() => {
-            setView("monitors");
-            setDetailTab("settings");
-          }}
+          onViewChange={selectView}
+          onAdd={openAddMonitor}
         />
         <section className="workspace-body">
           <MainView
@@ -343,6 +395,7 @@ function App() {
         onTabChange={setDetailTab}
         onTokenSave={saveToken}
         onMonitorSave={saveMonitorConfig}
+        onMonitorRun={runMonitorSample}
         onFormChange={setForm}
         onCreate={createMonitor}
       />
@@ -490,6 +543,7 @@ function CommandBar({
   statusFilter,
   onQueryChange,
   onFilterChange,
+  onViewChange,
   onAdd
 }: {
   view: ViewKey;
@@ -497,11 +551,24 @@ function CommandBar({
   statusFilter: StatusFilter;
   onQueryChange: (value: string) => void;
   onFilterChange: (value: StatusFilter) => void;
+  onViewChange: (view: ViewKey) => void;
   onAdd: () => void;
 }) {
   const showFilters = view === "overview" || view === "monitors";
   return (
     <div className="commandbar">
+      <label className="mobile-view-select">
+        <Command size={16} />
+        <select
+          aria-label="Dashboard view"
+          onChange={(event) => onViewChange(event.currentTarget.value as ViewKey)}
+          value={view}
+        >
+          {navItems.map((item) => (
+            <option key={item.key} value={item.key}>{item.label}</option>
+          ))}
+        </select>
+      </label>
       {showFilters ? (
         <>
           <label className="search-box">
@@ -788,7 +855,8 @@ function IncidentsView({ incidents }: { incidents: Incident[] }) {
 
 function UsageView({ summary, health }: { summary: Summary; health: HealthSummary }) {
   const rows: Array<[string, string | number, number]> = [
-    ["Worker requests", formatNumber(summary.usage.probeResults), Math.min(100, Math.round((summary.usage.probeResults / 100_000) * 100))],
+    ["Probe results", formatNumber(summary.usage.probeResults), Math.min(100, Math.round((summary.usage.probeResults / 100_000) * 100))],
+    ["Tracked Worker runs", formatNumber(summary.usage.workerInvocations), Math.min(100, Math.round((summary.usage.workerInvocations / 100_000) * 100))],
     ["Analytics points", formatNumber(summary.usage.probeResults), Math.min(100, Math.round((summary.usage.probeResults / 100_000) * 100))],
     ["D1 writes", formatNumber(summary.usage.d1Writes), Math.min(100, Math.round((summary.usage.d1Writes / 100_000) * 100))],
     ["Queue messages", formatNumber(summary.usage.queueMessages), Math.min(100, Math.round((summary.usage.queueMessages / 10_000) * 100))]
@@ -814,6 +882,32 @@ function UsageView({ summary, health }: { summary: Summary; health: HealthSummar
               <em>{pct}%</em>
             </div>
           ))}
+        </Card.Content>
+      </Card>
+      <Card className="data-card" variant="default">
+        <Card.Header>
+          <div>
+            <Card.Title>Recent scheduler runs</Card.Title>
+            <Card.Description>Manual samples and cron runs persisted from the control Worker.</Card.Description>
+          </div>
+          <Chip size="sm" variant="soft">{summary.runs.length} runs</Chip>
+        </Card.Header>
+        <Card.Content className="run-list">
+          {summary.runs.length ? summary.runs.slice(0, 10).map((run) => (
+            <Surface className="run-row" key={run.id}>
+              <div>
+                <strong>{run.trigger === "manual" ? "Manual" : "Cron"} run</strong>
+                <span>{relativeTime(run.startedAt)} · {run.id}</span>
+              </div>
+              <Chip color={run.error ? "danger" : "success"} size="sm" variant="soft">
+                {run.error ? "failed" : "ok"}
+              </Chip>
+              <span>{run.dispatchedJobs} / {run.plannedJobs} jobs</span>
+              <span>{run.error ? compactText(run.error, 48) : run.finishedAt ? `finished ${relativeTime(run.finishedAt)}` : `${run.skippedJobs} skipped`}</span>
+            </Surface>
+          )) : (
+            <div className="notice-panel">No scheduler runs recorded yet.</div>
+          )}
         </Card.Content>
       </Card>
     </>
@@ -1029,6 +1123,7 @@ function Inspector({
   onTabChange,
   onTokenSave,
   onMonitorSave,
+  onMonitorRun,
   onFormChange,
   onCreate
 }: {
@@ -1036,13 +1131,14 @@ function Inspector({
   monitor: MonitorConfig | null;
   latest: LatestResult[];
   tab: DetailTab;
-  form: { url: string; name: string; dailyBudget: string; method: MonitorMethod };
+  form: MonitorDraft;
   token: string;
   loading: boolean;
   onTabChange: (tab: DetailTab) => void;
   onTokenSave: (value: string) => void | Promise<void>;
   onMonitorSave: (id: string, patch: MonitorConfigPatch) => void | Promise<void>;
-  onFormChange: (form: { url: string; name: string; dailyBudget: string; method: MonitorMethod }) => void;
+  onMonitorRun: (id: string) => void | Promise<void>;
+  onFormChange: (form: MonitorDraft) => void;
   onCreate: () => void;
 }) {
   const status = monitorStatus(latest);
@@ -1083,11 +1179,18 @@ function Inspector({
             monitor={monitor}
             tokenSet={Boolean(token.trim())}
             onMonitorSave={onMonitorSave}
+            onMonitorRun={onMonitorRun}
             onTokenSave={onTokenSave}
           />
         </Tabs.Panel>
       </Tabs>
-      <AddMonitorForm form={form} loading={loading} onChange={onFormChange} onCreate={onCreate} />
+      <AddMonitorForm
+        form={form}
+        loading={loading}
+        tokenSet={Boolean(token.trim())}
+        onChange={onFormChange}
+        onCreate={onCreate}
+      />
     </aside>
   );
 }
@@ -1152,18 +1255,20 @@ function SettingsPanel({
   loading,
   tokenSet,
   onMonitorSave,
+  onMonitorRun,
   onTokenSave
 }: {
   monitor: MonitorConfig | null;
   loading: boolean;
   tokenSet: boolean;
   onMonitorSave: (id: string, patch: MonitorConfigPatch) => void | Promise<void>;
+  onMonitorRun: (id: string) => void | Promise<void>;
   onTokenSave: (value: string) => void | Promise<void>;
 }) {
   return (
     <div className="settings-panel">
       {monitor ? (
-        <MonitorConfigForm loading={loading} monitor={monitor} onSave={onMonitorSave} />
+        <MonitorConfigForm loading={loading} monitor={monitor} onRun={onMonitorRun} onSave={onMonitorSave} />
       ) : null}
       <div className="settings-meta">
         <strong>Access token</strong>
@@ -1176,32 +1281,34 @@ function SettingsPanel({
 function MonitorConfigForm({
   monitor,
   loading,
+  onRun,
   onSave
 }: {
   monitor: MonitorConfig;
   loading: boolean;
+  onRun: (id: string) => void | Promise<void>;
   onSave: (id: string, patch: MonitorConfigPatch) => void | Promise<void>;
 }) {
   const [form, setForm] = useState(() => monitorToForm(monitor));
+  const [validationError, setValidationError] = useState<string | null>(null);
 
   useEffect(() => {
     setForm(monitorToForm(monitor));
+    setValidationError(null);
   }, [monitor.id, monitor.updatedAt]);
+
+  const savedForm = monitorToForm(monitor);
+  const dirty = JSON.stringify(form) !== JSON.stringify(savedForm);
 
   async function save(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    await onSave(monitor.id, {
-      name: form.name,
-      url: form.url,
-      method: form.method,
-      expectedStatusMin: Number.parseInt(form.expectedStatusMin, 10),
-      expectedStatusMax: Number.parseInt(form.expectedStatusMax, 10),
-      bodyMatch: form.bodyMatch.trim() || null,
-      timeoutMs: Number.parseInt(form.timeoutMs, 10),
-      dailyBudget: Number.parseInt(form.dailyBudget, 10),
-      enabled: form.enabled,
-      tags: splitTags(form.tags)
-    });
+    const parsed = parseMonitorForm(form);
+    if (!parsed.ok) {
+      setValidationError(parsed.error);
+      return;
+    }
+    setValidationError(null);
+    await onSave(monitor.id, parsed.patch);
   }
 
   return (
@@ -1309,9 +1416,16 @@ function MonitorConfigForm({
         <InfoItem label="Monitor ID" value={monitor.id} />
         <InfoItem label="Updated" value={relativeTime(monitor.updatedAt)} />
       </div>
-      <Button className="primary-action" fullWidth isDisabled={loading} size="sm" type="submit" variant="primary">
-        Save configuration
-      </Button>
+      <div className="form-actions-grid">
+        <Button isDisabled={loading || !monitor.enabled || dirty} onPress={() => onRun(monitor.id)} size="sm" type="button" variant="secondary">
+          <Play size={15} />
+          {dirty ? "Save first" : "Run all regions"}
+        </Button>
+        <Button className="primary-action" isDisabled={loading} size="sm" type="submit" variant="primary">
+          Save configuration
+        </Button>
+      </div>
+      {validationError ? <div className="notice-panel danger">{validationError}</div> : null}
     </form>
   );
 }
@@ -1319,12 +1433,14 @@ function MonitorConfigForm({
 function AddMonitorForm({
   form,
   loading,
+  tokenSet,
   onChange,
   onCreate
 }: {
-  form: { url: string; name: string; dailyBudget: string; method: MonitorMethod };
+  form: MonitorDraft;
   loading: boolean;
-  onChange: (form: { url: string; name: string; dailyBudget: string; method: MonitorMethod }) => void;
+  tokenSet: boolean;
+  onChange: (form: MonitorDraft) => void;
   onCreate: () => void;
 }) {
   return (
@@ -1374,9 +1490,56 @@ function AddMonitorForm({
             <option value="GET">GET</option>
           </select>
         </label>
-        <Button className="primary-action" fullWidth isDisabled={loading} onPress={onCreate} variant="primary">
+        <div className="form-row">
+          <Input
+            aria-label="Expected status min"
+            fullWidth
+            max={599}
+            min={100}
+            onChange={(event) => onChange({ ...form, expectedStatusMin: event.currentTarget.value })}
+            type="number"
+            value={form.expectedStatusMin}
+            variant="secondary"
+          />
+          <Input
+            aria-label="Expected status max"
+            fullWidth
+            max={599}
+            min={100}
+            onChange={(event) => onChange({ ...form, expectedStatusMax: event.currentTarget.value })}
+            type="number"
+            value={form.expectedStatusMax}
+            variant="secondary"
+          />
+        </div>
+        <Input
+          aria-label="Timeout milliseconds"
+          fullWidth
+          max={60000}
+          min={1000}
+          onChange={(event) => onChange({ ...form, timeoutMs: event.currentTarget.value })}
+          type="number"
+          value={form.timeoutMs}
+          variant="secondary"
+        />
+        <textarea
+          aria-label="Body match"
+          className="textarea-control compact"
+          onChange={(event) => onChange({ ...form, bodyMatch: event.currentTarget.value })}
+          placeholder="Optional response text match for GET checks"
+          value={form.bodyMatch}
+        />
+        <Input
+          aria-label="Tags"
+          fullWidth
+          onChange={(event) => onChange({ ...form, tags: event.currentTarget.value })}
+          placeholder="production, api"
+          value={form.tags}
+          variant="secondary"
+        />
+        <Button className="primary-action" fullWidth isDisabled={loading || !tokenSet} onPress={onCreate} variant="primary">
           <Plus size={16} />
-          Create Monitor
+          {tokenSet ? "Create Monitor" : "Token required"}
         </Button>
       </Card.Content>
     </Card>
@@ -1508,6 +1671,10 @@ function formatNumber(value: number) {
   return new Intl.NumberFormat("en", { maximumFractionDigits: 0 }).format(value);
 }
 
+function compactText(value: string, max = 64) {
+  return value.length > max ? `${value.slice(0, max - 1)}...` : value;
+}
+
 function viewLabel(view: ViewKey) {
   return navItems.find((item) => item.key === view)?.label || "Overview";
 }
@@ -1532,6 +1699,64 @@ function splitTags(value: string) {
     .split(",")
     .map((item) => item.trim())
     .filter(Boolean);
+}
+
+function parseMonitorForm(
+  form: MonitorDraft & { enabled?: boolean }
+): { ok: true; patch: MonitorConfigPatch } | { ok: false; error: string } {
+  const url = form.url.trim();
+  if (!url) return { ok: false, error: "URL is required." };
+  try {
+    const parsed = new URL(url);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+      return { ok: false, error: "URL must use http or https." };
+    }
+  } catch {
+    return { ok: false, error: "URL must be valid." };
+  }
+
+  const dailyBudget = parseBoundedInt(form.dailyBudget, "Daily budget", 1, 10000);
+  if (!dailyBudget.ok) return dailyBudget;
+  const expectedStatusMin = parseBoundedInt(form.expectedStatusMin, "Expected status min", 100, 599);
+  if (!expectedStatusMin.ok) return expectedStatusMin;
+  const expectedStatusMax = parseBoundedInt(form.expectedStatusMax, "Expected status max", 100, 599);
+  if (!expectedStatusMax.ok) return expectedStatusMax;
+  if (expectedStatusMin.value > expectedStatusMax.value) {
+    return { ok: false, error: "Expected status min must be less than or equal to max." };
+  }
+  const timeoutMs = parseBoundedInt(form.timeoutMs, "Timeout", 1000, 60000);
+  if (!timeoutMs.ok) return timeoutMs;
+
+  const patch: MonitorConfigPatch = {
+    url,
+    name: form.name.trim(),
+    method: form.method,
+    expectedStatusMin: expectedStatusMin.value,
+    expectedStatusMax: expectedStatusMax.value,
+    bodyMatch: form.bodyMatch.trim() || null,
+    timeoutMs: timeoutMs.value,
+    dailyBudget: dailyBudget.value,
+    tags: splitTags(form.tags)
+  };
+  if (typeof form.enabled === "boolean") patch.enabled = form.enabled;
+  return {
+    ok: true,
+    patch
+  };
+}
+
+function parseBoundedInt(
+  input: string,
+  label: string,
+  min: number,
+  max: number
+): { ok: true; value: number } | { ok: false; error: string } {
+  if (!/^\d+$/.test(input.trim())) return { ok: false, error: `${label} must be a whole number.` };
+  const value = Number.parseInt(input, 10);
+  if (!Number.isFinite(value) || value < min || value > max) {
+    return { ok: false, error: `${label} must be between ${min} and ${max}.` };
+  }
+  return { ok: true, value };
 }
 
 createRoot(document.getElementById("root")!).render(<App />);

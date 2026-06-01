@@ -26,7 +26,7 @@ The project therefore separates:
 
 Daily budget is per monitor. The scheduler uses a cumulative floor function so a monitor with `100` daily probes runs exactly 100 times per UTC day, and a monitor with `10,000` daily probes runs exactly 10,000 times.
 
-Region selection rotates deterministically by monitor id and date. This avoids persistent hot spots without requiring mutable scheduler state.
+Region selection rotates deterministically by monitor id and date. Region weights expand the deterministic rotation pool, so a higher-weight region gets proportionally more probes without changing the monitor's daily budget. This avoids persistent hot spots without requiring mutable scheduler state.
 
 ## Review Findings
 
@@ -40,3 +40,5 @@ Region selection rotates deterministically by monitor id and date. This avoids p
 - Placement region support can drift. Use `scripts/list-supported-regions.mjs` before deploying a large region pack.
 - `/api/summary` is intentionally admin-gated because monitor URLs can contain private operational details.
 - Private, local, reserved, and credential-bearing target URLs are blocked by default.
+- Runtime config edits must affect runtime behavior immediately; monitor edits reset stale latest state, region weights feed the scheduler, and manual samples validate a selected monitor after edits.
+- Scheduler run records should be kept lightweight and bounded in the dashboard because D1 remains the source of truth for config/latest data, not a high-volume event store.

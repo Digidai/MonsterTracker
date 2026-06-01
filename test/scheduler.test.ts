@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { cumulativeQuotaBeforeMinute, quotaForMinute, stableHash } from "../src/scheduler";
+import type { MonitorConfig, RegionConfig } from "../src/domain";
+import { buildSchedulePlan, cumulativeQuotaBeforeMinute, quotaForMinute, stableHash } from "../src/scheduler";
 
 describe("scheduler budget distribution", () => {
   it("distributes exactly the daily budget across a UTC day", () => {
@@ -34,4 +35,83 @@ describe("scheduler budget distribution", () => {
     expect(stableHash("monitor:2026-05-31")).toBe(stableHash("monitor:2026-05-31"));
     expect(stableHash("monitor:2026-05-31")).toBeGreaterThanOrEqual(0);
   });
+
+  it("uses region weights without changing the daily monitor budget", () => {
+    const counts = new Map<string, number>();
+    let total = 0;
+    for (let minute = 0; minute < 1440; minute += 1) {
+      const at = new Date(Date.UTC(2026, 5, 1, 0, minute));
+      const plan = buildSchedulePlan(
+        [makeMonitor(1440)],
+        [makeRegion("primary", 3), makeRegion("secondary", 1)],
+        at
+      );
+      for (const job of plan.jobs) {
+        counts.set(job.region.id, (counts.get(job.region.id) ?? 0) + 1);
+        total += 1;
+      }
+    }
+
+    expect(total).toBe(1440);
+    expect(counts.get("primary")).toBe(1080);
+    expect(counts.get("secondary")).toBe(360);
+  });
+
+  it("skips disabled regions regardless of weight", () => {
+    const counts = new Map<string, number>();
+    for (let minute = 0; minute < 1440; minute += 1) {
+      const at = new Date(Date.UTC(2026, 5, 1, 0, minute));
+      const plan = buildSchedulePlan(
+        [makeMonitor(1440)],
+        [makeRegion("paused", 100, false), makeRegion("active", 1)],
+        at
+      );
+      for (const job of plan.jobs) {
+        counts.set(job.region.id, (counts.get(job.region.id) ?? 0) + 1);
+      }
+    }
+
+    expect(counts.get("paused")).toBeUndefined();
+    expect(counts.get("active")).toBe(1440);
+  });
 });
+
+function makeMonitor(dailyBudget: number): MonitorConfig {
+  return {
+    id: "mon_test",
+    name: "Test monitor",
+    url: "https://example.com",
+    method: "HEAD",
+    expectedStatusMin: 200,
+    expectedStatusMax: 399,
+    bodyMatch: null,
+    timeoutMs: 10000,
+    dailyBudget,
+    enabled: true,
+    tags: [],
+    createdAt: "2026-06-01T00:00:00.000Z",
+    updatedAt: "2026-06-01T00:00:00.000Z"
+  };
+}
+
+function makeRegion(id: string, weight: number, enabled = true): RegionConfig {
+  return {
+    id,
+    label: id,
+    area: "test",
+    provider: "aws",
+    providerRegion: "us-east-1",
+    placementRegion: "aws:us-east-1",
+    workerName: `monstertracker-probe-${id}`,
+    workerUrl: `https://${id}.example.workers.dev`,
+    tier: "core",
+    enabled,
+    weight,
+    lastSeenColo: null,
+    lastSeenCountry: null,
+    lastSeenPlacement: null,
+    lastSeenAt: null,
+    createdAt: "2026-06-01T00:00:00.000Z",
+    updatedAt: "2026-06-01T00:00:00.000Z"
+  };
+}

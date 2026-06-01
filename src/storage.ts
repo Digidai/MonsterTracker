@@ -6,6 +6,7 @@ import type {
   ProbeResult,
   RegionConfig,
   RuntimeEnv,
+  SchedulerRun,
   Summary,
   UsageSummary
 } from "./domain";
@@ -56,6 +57,16 @@ export interface UpdateRegionInput {
   workerUrl?: string | null;
   enabled?: boolean;
   weight?: number;
+}
+
+export interface RecordSchedulerRunInput {
+  id: string;
+  startedAt: string;
+  finishedAt?: string | null;
+  plannedJobs: number;
+  dispatchedJobs: number;
+  skippedJobs: number;
+  error?: string | null;
 }
 
 export async function bootstrapDefaults(env: RuntimeEnv): Promise<void> {
@@ -290,6 +301,18 @@ export async function listOpenIncidents(env: RuntimeEnv): Promise<Incident[]> {
   return (result.results ?? []).map(mapIncident);
 }
 
+export async function listSchedulerRuns(env: RuntimeEnv, limit = 25): Promise<SchedulerRun[]> {
+  const safeLimit = Math.max(1, Math.min(100, Math.floor(limit)));
+  const result = await env.DB.prepare(
+    `SELECT * FROM scheduler_runs
+     ORDER BY started_at DESC
+     LIMIT ?`
+  )
+    .bind(safeLimit)
+    .all<DbRow>();
+  return (result.results ?? []).map(mapSchedulerRun);
+}
+
 export async function getUsageSummary(env: RuntimeEnv): Promise<UsageSummary> {
   const today = new Date().toISOString().slice(0, 10);
   const row = await env.DB.prepare("SELECT * FROM daily_usage WHERE date = ?").bind(today).first<DbRow>();
@@ -307,11 +330,12 @@ export async function getUsageSummary(env: RuntimeEnv): Promise<UsageSummary> {
 
 export async function getSummary(env: RuntimeEnv): Promise<Summary> {
   await bootstrapDefaults(env);
-  const [monitors, regions, latest, incidents, usage] = await Promise.all([
+  const [monitors, regions, latest, incidents, runs, usage] = await Promise.all([
     listMonitors(env),
     listRegions(env),
     listLatest(env),
     listOpenIncidents(env),
+    listSchedulerRuns(env),
     getUsageSummary(env)
   ]);
   return {
@@ -320,8 +344,34 @@ export async function getSummary(env: RuntimeEnv): Promise<Summary> {
     regions,
     latest,
     incidents,
+    runs,
     usage
   };
+}
+
+export async function recordSchedulerRun(env: RuntimeEnv, input: RecordSchedulerRunInput): Promise<void> {
+  await env.DB.prepare(
+    `INSERT INTO scheduler_runs (
+      id, started_at, finished_at, planned_jobs, dispatched_jobs, skipped_jobs, error
+    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(id) DO UPDATE SET
+      started_at = excluded.started_at,
+      finished_at = excluded.finished_at,
+      planned_jobs = excluded.planned_jobs,
+      dispatched_jobs = excluded.dispatched_jobs,
+      skipped_jobs = excluded.skipped_jobs,
+      error = excluded.error`
+  )
+    .bind(
+      input.id,
+      input.startedAt,
+      input.finishedAt ?? null,
+      input.plannedJobs,
+      input.dispatchedJobs,
+      input.skippedJobs,
+      input.error ?? null
+    )
+    .run();
 }
 
 export async function saveProbeResults(env: RuntimeEnv, results: ProbeResult[]): Promise<void> {
@@ -438,7 +488,10 @@ export async function recordWorkerInvocation(env: RuntimeEnv, count = 1): Promis
 export async function cleanupRetention(env: RuntimeEnv): Promise<void> {
   const days = parsePositiveInt(env.DEFAULT_RETENTION_DAYS, 30);
   const cutoff = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
-  await env.DB.prepare("DELETE FROM probe_results WHERE checked_at < ?").bind(cutoff).run();
+  await env.DB.batch([
+    env.DB.prepare("DELETE FROM probe_results WHERE checked_at < ?").bind(cutoff),
+    env.DB.prepare("DELETE FROM scheduler_runs WHERE started_at < ?").bind(cutoff)
+  ]);
 }
 
 async function bumpDailyUsage(
@@ -633,6 +686,20 @@ function mapUsage(row: DbRow): UsageSummary {
     workerInvocations: numberField(row, "worker_invocations"),
     queueMessages: numberField(row, "queue_messages"),
     d1Writes: numberField(row, "d1_writes")
+  };
+}
+
+function mapSchedulerRun(row: DbRow): SchedulerRun {
+  const id = textField(row, "id");
+  return {
+    id,
+    startedAt: textField(row, "started_at"),
+    finishedAt: nullableTextField(row, "finished_at"),
+    plannedJobs: numberField(row, "planned_jobs"),
+    dispatchedJobs: numberField(row, "dispatched_jobs"),
+    skippedJobs: numberField(row, "skipped_jobs"),
+    error: nullableTextField(row, "error"),
+    trigger: id.startsWith("manual_") ? "manual" : "scheduled"
   };
 }
 

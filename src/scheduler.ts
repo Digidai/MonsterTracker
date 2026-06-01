@@ -27,7 +27,7 @@ export function buildSchedulePlan(
   runId = `run_${scheduledAt.toISOString().replace(/\D/g, "")}`
 ): SchedulePlan {
   const enabledMonitors = monitors.filter((monitor) => monitor.enabled && monitor.dailyBudget > 0);
-  const enabledRegions = regions.filter((region) => region.enabled);
+  const enabledRegions = expandWeightedRegions(regions);
   const minuteOfDay = scheduledAt.getUTCHours() * 60 + scheduledAt.getUTCMinutes();
   const dayKey = scheduledAt.toISOString().slice(0, 10);
   const jobs: ProbeJob[] = [];
@@ -68,6 +68,18 @@ export function buildSchedulePlan(
   }
 
   return { runId, scheduledAt: scheduledAt.toISOString(), jobs };
+}
+
+export function expandWeightedRegions(regions: RegionConfig[]): RegionConfig[] {
+  const slots: RegionConfig[] = [];
+  for (const region of regions) {
+    if (!region.enabled) continue;
+    const weight = Number.isFinite(region.weight) ? Math.max(1, Math.min(100, Math.floor(region.weight))) : 1;
+    for (let index = 0; index < weight; index += 1) {
+      slots.push(region);
+    }
+  }
+  return slots;
 }
 
 export function stableHash(input: string): number {

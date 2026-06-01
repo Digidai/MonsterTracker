@@ -13,10 +13,17 @@ import {
   listMonitors,
   listRegions,
   recordQueueMessages,
+  recordSchedulerRun,
+  recordWorkerInvocation,
   saveProbeResults,
   updateMonitor,
   updateRegion
 } from "./storage";
+
+interface DispatchOutcome {
+  results: ProbeResult[];
+  probeInvocations: number;
+}
 
 export default {
   async fetch(request: Request, env: RuntimeEnv, ctx: ExecutionContext): Promise<Response> {
@@ -40,14 +47,38 @@ export default {
     const regions = await listRegions(env);
     const plan = buildSchedulePlan(monitors, regions, scheduledAt);
     const baseUrl = env.PUBLIC_BASE_URL || "http://localhost:8787";
-    const results = await dispatchJobs(env, plan.jobs, baseUrl);
-    await persistResults(env, ctx, results);
-    ctx.waitUntil(cleanupRetention(env));
+    const startedAt = nowIso();
+    try {
+      const outcome = await dispatchJobs(env, plan.jobs, baseUrl);
+      await persistResults(env, ctx, outcome.results);
+      await recordSchedulerRunSafely(env, {
+        id: plan.runId,
+        startedAt,
+        finishedAt: nowIso(),
+        plannedJobs: plan.jobs.length,
+        dispatchedJobs: outcome.results.length,
+        skippedJobs: Math.max(0, plan.jobs.length - outcome.results.length)
+      });
+      await recordWorkerInvocationSafely(env, 1 + outcome.probeInvocations);
+      ctx.waitUntil(cleanupRetention(env));
+    } catch (caught) {
+      await recordSchedulerRunSafely(env, {
+        id: plan.runId,
+        startedAt,
+        finishedAt: nowIso(),
+        plannedJobs: plan.jobs.length,
+        dispatchedJobs: 0,
+        skippedJobs: plan.jobs.length,
+        error: caught instanceof Error ? caught.message : "scheduled_run_failed"
+      });
+      throw caught;
+    }
   },
 
   async queue(batch: MessageBatch<ProbeResult[]>, env: RuntimeEnv, ctx: ExecutionContext): Promise<void> {
     const results = batch.messages.flatMap((message) => message.body);
     await saveProbeResults(env, results);
+    await recordWorkerInvocationSafely(env, 1);
     ctx.waitUntil(archiveProbeResults(env, results));
   }
 };
@@ -117,25 +148,54 @@ async function handleControlRequest(
     const unauthorized = requireAdmin(request, env);
     if (unauthorized) return unauthorized;
     await bootstrapDefaults(env);
-    const payload = await request.json().catch(() => ({}));
-    const monitors = applyGlobalDailyCap(await listMonitors(env), parsePositiveInt(env.MAX_DAILY_PROBES, 10_000));
-    const regions = await listRegions(env);
-    const mode = typeof payload === "object" && payload && "mode" in payload ? String(payload.mode) : "sample";
-    const scheduledAt = new Date();
-    let jobs = buildSchedulePlan(monitors, regions, scheduledAt, createId("manual")).jobs;
-    if (mode !== "due" || jobs.length === 0) {
-      jobs = buildSampleJobs(monitors, regions, scheduledAt);
+    const payload = parseRunRequestInput(await request.json().catch(() => ({})));
+    let monitors = applyGlobalDailyCap(await listMonitors(env), parsePositiveInt(env.MAX_DAILY_PROBES, 10_000));
+    if (payload.monitorId) {
+      const selected = monitors.find((monitor) => monitor.id === payload.monitorId);
+      if (!selected) return jsonError("Monitor not found.", 404);
+      monitors = [selected];
     }
-    const results = await dispatchJobs(env, jobs, url.origin);
-    await persistResults(env, ctx, results);
-    return Response.json({
-      plannedJobs: jobs.length,
-      dispatchedJobs: results.length,
-      queued: Boolean(env.RESULTS_QUEUE)
-    });
+    const regions = await listRegions(env);
+    const scheduledAt = new Date();
+    const runId = createId("manual");
+    const startedAt = nowIso();
+    let jobs = buildSchedulePlan(monitors, regions, scheduledAt, runId).jobs;
+    if (payload.mode !== "due" || jobs.length === 0) {
+      jobs = buildSampleJobs(monitors, regions, scheduledAt, runId, payload.monitorId ? "all-regions" : "one-per-monitor");
+    }
+    try {
+      const outcome = await dispatchJobs(env, jobs, url.origin);
+      await persistResults(env, ctx, outcome.results);
+      await recordSchedulerRunSafely(env, {
+        id: runId,
+        startedAt,
+        finishedAt: nowIso(),
+        plannedJobs: jobs.length,
+        dispatchedJobs: outcome.results.length,
+        skippedJobs: Math.max(0, jobs.length - outcome.results.length)
+      });
+      await recordWorkerInvocationSafely(env, 1 + outcome.probeInvocations);
+      return Response.json({
+        runId,
+        plannedJobs: jobs.length,
+        dispatchedJobs: outcome.results.length,
+        queued: Boolean(env.RESULTS_QUEUE)
+      });
+    } catch (caught) {
+      await recordSchedulerRunSafely(env, {
+        id: runId,
+        startedAt,
+        finishedAt: nowIso(),
+        plannedJobs: jobs.length,
+        dispatchedJobs: 0,
+        skippedJobs: jobs.length,
+        error: caught instanceof Error ? caught.message : "manual_run_failed"
+      });
+      return jsonError(caught instanceof Error ? caught.message : "Run failed.", 500);
+    }
   }
 
-  if (request.method === "GET" && !url.pathname.startsWith("/api/")) {
+  if ((request.method === "GET" || request.method === "HEAD") && !url.pathname.startsWith("/api/")) {
     if (env.ASSETS) return env.ASSETS.fetch(request);
     return jsonError("Dashboard assets are not configured.", 503);
   }
@@ -173,13 +233,17 @@ async function handleInternalProbe(request: Request, env: RuntimeEnv): Promise<R
   return Response.json({ results });
 }
 
-async function dispatchJobs(env: RuntimeEnv, jobs: ProbeJob[], origin: string): Promise<ProbeResult[]> {
+async function dispatchJobs(env: RuntimeEnv, jobs: ProbeJob[], origin: string): Promise<DispatchOutcome> {
   const groups = new Map<string, ProbeJob[]>();
   const batchSize = parsePositiveInt(env.PROBE_BATCH_SIZE, 50);
   const results: ProbeResult[] = [];
+  let probeInvocations = 0;
   const localMode = env.ALLOW_LOCAL_PROBES === "true";
   if (!env.SHARED_SECRET && !localMode) {
-    return jobs.map((job) => dispatchErrorResult(job, "shared_secret_missing"));
+    return {
+      results: jobs.map((job) => dispatchErrorResult(job, "shared_secret_missing")),
+      probeInvocations
+    };
   }
 
   for (const job of jobs) {
@@ -196,6 +260,7 @@ async function dispatchJobs(env: RuntimeEnv, jobs: ProbeJob[], origin: string): 
   for (const [probeUrl, groupJobs] of groups) {
     for (let index = 0; index < groupJobs.length; index += batchSize) {
       const chunk = groupJobs.slice(index, index + batchSize);
+      probeInvocations += 1;
       try {
         const response = await fetch(probeUrl, {
           method: "POST",
@@ -225,7 +290,7 @@ async function dispatchJobs(env: RuntimeEnv, jobs: ProbeJob[], origin: string): 
     }
   }
 
-  return results;
+  return { results, probeInvocations };
 }
 
 async function persistResults(env: RuntimeEnv, ctx: ExecutionContext, results: ProbeResult[]): Promise<void> {
@@ -277,16 +342,22 @@ function withProbePath(base: string): string {
   return url.toString();
 }
 
-function buildSampleJobs(monitors: Awaited<ReturnType<typeof listMonitors>>, regions: Awaited<ReturnType<typeof listRegions>>, date: Date): ProbeJob[] {
+function buildSampleJobs(
+  monitors: Awaited<ReturnType<typeof listMonitors>>,
+  regions: Awaited<ReturnType<typeof listRegions>>,
+  date: Date,
+  runId = createId("manual"),
+  scope: "one-per-monitor" | "all-regions" = "one-per-monitor"
+): ProbeJob[] {
   const enabledRegions = regions.filter((region) => region.enabled);
   if (enabledRegions.length === 0) return [];
-  const runId = createId("manual");
-  return monitors
-    .filter((monitor) => monitor.enabled)
-    .map((monitor, index) => {
-      const region = enabledRegions[index % enabledRegions.length];
-      if (!region) return null;
-      return {
+  const jobs: ProbeJob[] = [];
+  const enabledMonitors = monitors.filter((monitor) => monitor.enabled);
+  for (const [monitorIndex, monitor] of enabledMonitors.entries()) {
+    const sampleRegions = scope === "all-regions" ? enabledRegions : [enabledRegions[monitorIndex % enabledRegions.length]];
+    for (const region of sampleRegions) {
+      if (!region) continue;
+      jobs.push({
         runId,
         scheduledAt: date.toISOString(),
         monitor: {
@@ -305,9 +376,10 @@ function buildSampleJobs(monitors: Awaited<ReturnType<typeof listMonitors>>, reg
           placementRegion: region.placementRegion,
           workerUrl: region.workerUrl
         }
-      };
-    })
-    .filter((job): job is ProbeJob => job !== null);
+      });
+    }
+  }
+  return jobs;
 }
 
 function dispatchErrorResult(job: ProbeJob, error: string): ProbeResult {
@@ -405,6 +477,14 @@ function parseUpdateRegionInput(input: unknown) {
   return output;
 }
 
+function parseRunRequestInput(input: unknown): { mode: "due" | "sample"; monitorId?: string } {
+  if (!input || typeof input !== "object") return { mode: "sample" };
+  const value = input as Record<string, unknown>;
+  const mode = value.mode === "due" ? "due" : "sample";
+  const monitorId = typeof value.monitorId === "string" && value.monitorId.trim() ? value.monitorId.trim() : undefined;
+  return monitorId ? { mode, monitorId } : { mode };
+}
+
 function applyGlobalDailyCap<T extends { dailyBudget: number; enabled?: boolean }>(monitors: T[], maxDailyProbes: number): T[] {
   const enabledMonitors = monitors.filter((monitor) => monitor.enabled !== false);
   const enabledBudget = enabledMonitors.reduce((total, monitor) => total + Math.max(0, monitor.dailyBudget), 0);
@@ -423,4 +503,23 @@ function applyGlobalDailyCap<T extends { dailyBudget: number; enabled?: boolean 
 
 function jsonError(message: string, status: number): Response {
   return Response.json({ error: message }, { status });
+}
+
+async function recordWorkerInvocationSafely(env: RuntimeEnv, count: number): Promise<void> {
+  try {
+    await recordWorkerInvocation(env, count);
+  } catch (caught) {
+    console.warn("worker_invocation_usage_record_failed", caught instanceof Error ? caught.message : caught);
+  }
+}
+
+async function recordSchedulerRunSafely(
+  env: RuntimeEnv,
+  input: Parameters<typeof recordSchedulerRun>[1]
+): Promise<void> {
+  try {
+    await recordSchedulerRun(env, input);
+  } catch (caught) {
+    console.warn("scheduler_run_record_failed", caught instanceof Error ? caught.message : caught);
+  }
 }

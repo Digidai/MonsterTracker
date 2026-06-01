@@ -52,6 +52,9 @@ minute quota = floor((minute + 1) * daily_budget / 1440)
 ```
 
 This guarantees each monitor gets exactly its configured daily budget over a UTC day.
+Region `weight` changes only the deterministic region rotation. It does not
+increase the monitor budget; a region with weight `3` receives about three times
+the scheduled probes of a region with weight `1`.
 
 ## Cost Example
 
@@ -114,6 +117,8 @@ The dashboard can update D1-backed runtime configuration without redeploying:
 
 - Monitor settings: name, URL, method, expected status range, body match, timeout, daily budget, enabled state, and tags.
 - Region dispatch settings: `worker_url`, enabled state, and scheduling weight.
+- Manual validation: run the due schedule globally or sample a selected monitor across every enabled region after changing its configuration.
+- Run history: recent cron/manual scheduler runs are persisted in D1 for operational review.
 
 Secrets and Worker environment variables are intentionally not editable from the dashboard. Keep `ADMIN_TOKEN`, `SHARED_SECRET`, and deployment bindings managed through Wrangler and `wrangler.jsonc`.
 

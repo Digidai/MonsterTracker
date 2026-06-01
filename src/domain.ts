@@ -90,6 +90,7 @@ export interface Summary {
   regions: RegionConfig[];
   latest: LatestResult[];
   incidents: Incident[];
+  runs: SchedulerRun[];
   usage: UsageSummary;
 }
 
@@ -123,6 +124,17 @@ export interface UsageSummary {
   workerInvocations: number;
   queueMessages: number;
   d1Writes: number;
+}
+
+export interface SchedulerRun {
+  id: string;
+  startedAt: string;
+  finishedAt: string | null;
+  plannedJobs: number;
+  dispatchedJobs: number;
+  skippedJobs: number;
+  error: string | null;
+  trigger: "scheduled" | "manual";
 }
 
 export type RuntimeEnv = Omit<
