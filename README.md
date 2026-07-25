@@ -51,7 +51,8 @@ minute quota = floor((minute + 1) * daily_budget / 1440)
              - floor(minute * daily_budget / 1440)
 ```
 
-This guarantees each monitor gets exactly its configured daily budget over a UTC day.
+When all minute Cron Triggers run, this produces exactly the configured daily
+budget over a UTC day. Missed Cron Triggers are recorded but are not replayed.
 Region `weight` changes only the deterministic region rotation. It does not
 increase the monitor budget; a region with weight `3` receives about three times
 the scheduled probes of a region with weight `1`.
@@ -62,16 +63,16 @@ For `10 URLs / 10,000 total probes per day`:
 
 | Item | Daily Use | Free Quota Fit |
 |---|---:|---|
-| Worker requests, worst case | 10,000 | yes, Free has 100,000/day |
+| Worker invocations, conservative | about 14,320 | yes, Free has 100,000/day |
 | Worker outbound fetches | 10,000 | not billed as separate subrequests |
 | Analytics Engine points | 10,000 | yes, Free has 100,000/day |
 | D1 writes | about 30,000/day before index overhead | yes, Free has 100,000 writes/day |
-| Queue operations | 600/day with 50-result batches | yes, Free has 10,000 ops/day |
+| Queue operations | about 8,640/day with 5-result, minute-bounded batches | yes, with limited headroom below 10,000/day |
 | R2 archive | MB-level | yes, Free includes 10 GB-month |
 
 MonsterTracker writes about three D1 rows/statements per probe in the default raw-results mode: raw result, latest result, and region calibration. For 10,000 probes/day, budget around 30,000 D1 writes/day before index overhead and incident updates.
 
-Expected Cloudflare bill: **$0/month** if you batch Queue messages and stay within Free Worker count/cron/D1 limits.
+Expected Cloudflare bill: **$0/month** for this workload when the default 5-result Queue batch is retained and all Free Worker, Cron, D1, Queue, Analytics Engine, and R2 limits remain available. Queue capacity is the closest limit in this example.
 
 Free-tier deployments should keep the core region pack unless they understand the subrequest limit. The control Worker makes one outbound request per active probe Worker in a scheduler invocation. Core uses 24 regions; extended uses more than 50 and is meant for Workers Paid or future sharded dispatch.
 
@@ -80,7 +81,7 @@ The committed control Worker config includes `global_fetch_strictly_public`. Clo
 Use the built-in estimator:
 
 ```bash
-curl "http://localhost:8787/api/cost?urls=10&probesPerDay=10000&queueBatchSize=50"
+curl "http://localhost:8787/api/cost?urls=10&probesPerDay=10000&queueBatchSize=5"
 ```
 
 ## Local Development
@@ -119,8 +120,15 @@ The dashboard can update D1-backed runtime configuration without redeploying:
 - Region dispatch settings: `worker_url`, enabled state, and scheduling weight.
 - Manual validation: run the due schedule globally or sample a selected monitor across every enabled region after changing its configuration.
 - Run history: recent cron/manual scheduler runs are persisted in D1 for operational review.
+- Probe history: the inspector loads the latest 100 raw results for the selected monitor.
+- Incident history: open and resolved incidents remain visible until retention cleanup.
+- Freshness states: the dashboard distinguishes current failures from stale or never-seen data.
 
 Secrets and Worker environment variables are intentionally not editable from the dashboard. Keep `ADMIN_TOKEN`, `SHARED_SECRET`, and deployment bindings managed through Wrangler and `wrangler.jsonc`.
+
+`Run Due Now` only executes work due in the current UTC minute. It does not
+fall back to an unscheduled sample. Use the monitor inspector's regional sample
+action when you intentionally want one probe from every enabled region.
 
 ## Cloudflare Deployment
 
@@ -130,6 +138,7 @@ Create resources:
 wrangler d1 create monstertracker
 wrangler r2 bucket create monstertracker-archive
 wrangler queues create monstertracker-results
+wrangler queues create monstertracker-results-dlq
 ```
 
 Update `wrangler.jsonc` with the real D1 `database_id`.
@@ -147,6 +156,8 @@ Apply schema and deploy:
 npm run db:migrate:remote
 npm run deploy
 ```
+
+For upgrades, deploy the generated probe fleet first, then apply D1 migrations and deploy the control Worker. The protocol accepts legacy probe responses during that rolling window, but probe-first keeps every region on the newest timeout and validation behavior before the control plane begins sending new fields.
 
 For production, keep `ALLOW_LOCAL_PROBES=false`. Regional probes must be reached through `regions.worker_url` or `PROBE_URL_TEMPLATE`.
 
@@ -184,6 +195,7 @@ wrangler d1 execute monstertracker --remote --file /tmp/monstertracker-set-worke
 ```
 
 Do not run the generated file before replacing the placeholder.
+Also set `PROBE_WORKER_HOST_SUFFIX` in `wrangler.jsonc` to `.<YOUR_SUBDOMAIN>.workers.dev`; the control Worker rejects routes outside that account-scoped suffix so `SHARED_SECRET` cannot be redirected to an arbitrary host.
 
 Alternatively, set a template on the control Worker:
 
@@ -201,13 +213,21 @@ Important variables:
 | `SHARED_SECRET` | Secret for control-to-probe calls |
 | `REGION_PACK` | `core` or `extended` default seed regions |
 | `DEFAULT_DAILY_PROBE_BUDGET` | Default per-monitor daily probes |
-| `PROBE_BATCH_SIZE` | Results per Queue message |
+| `PROBE_BATCH_SIZE` | Jobs per control-to-probe HTTP request |
+| `RESULT_QUEUE_BATCH_SIZE` | Results per Queue message, capped at 5 for D1 Free query safety |
+| `PROBE_CONCURRENCY` | Concurrent target requests inside a probe Worker, capped at 6 |
+| `DISPATCH_CONCURRENCY` | Concurrent control-to-probe requests, capped at 6 |
+| `MAX_PROBE_RESPONSE_BYTES` | Maximum accepted probe Worker response size |
+| `MAX_DISPATCH_TIMEOUT_MS` | Maximum control-to-probe request lifetime |
 | `PROBE_URL_TEMPLATE` | Optional template like `https://monstertracker-probe-{id}.example.workers.dev` |
 | `PUBLIC_BASE_URL` | Control Worker URL used by cron in local/single-worker mode |
 | `ALLOW_LOCAL_PROBES` | Allows `/internal/probe` on localhost without secret |
 | `MAX_DAILY_PROBES` | Account-level scheduler cap across monitors |
 | `MAX_MONITOR_DAILY_BUDGET` | Per-monitor daily budget ceiling |
 | `ALLOW_PRIVATE_TARGETS` | Allows local/private/IP-literal targets when set to `true` |
+| `PROBE_WORKER_HOST_SUFFIX` | Required hostname suffix for regional Worker routes |
+
+The control plane atomically claims and reserves every planned probe against `MAX_DAILY_PROBES` before dispatch. Cron runs use a deterministic UTC-minute id, persist their jobs, and carry a 16-minute lease aligned with the Worker execution ceiling; later triggers reclaim interrupted work without overlapping a healthy invocation. Probe results carry a monitor configuration version; delayed Queue results from an older URL, method, expectation, or enabled state are archived but cannot update current D1 state or incidents.
 
 ## edgetunnel Research Notes
 

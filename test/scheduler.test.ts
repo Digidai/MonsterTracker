@@ -88,6 +88,7 @@ function makeMonitor(dailyBudget: number): MonitorConfig {
     timeoutMs: 10000,
     dailyBudget,
     enabled: true,
+    configVersion: 1,
     tags: [],
     createdAt: "2026-06-01T00:00:00.000Z",
     updatedAt: "2026-06-01T00:00:00.000Z"

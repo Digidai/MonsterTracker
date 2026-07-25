@@ -55,7 +55,8 @@ export function buildSchedulePlan(
           expectedStatusMin: monitor.expectedStatusMin,
           expectedStatusMax: monitor.expectedStatusMax,
           bodyMatch: monitor.bodyMatch,
-          timeoutMs: monitor.timeoutMs
+          timeoutMs: monitor.timeoutMs,
+          configVersion: monitor.configVersion
         },
         region: {
           id: region.id,

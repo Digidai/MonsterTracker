@@ -11,6 +11,7 @@ export interface MonitorConfig {
   timeoutMs: number;
   dailyBudget: number;
   enabled: boolean;
+  configVersion: number;
   tags: string[];
   createdAt: string;
   updatedAt: string;
@@ -59,6 +60,7 @@ export interface ProbeJob {
     | "expectedStatusMax"
     | "bodyMatch"
     | "timeoutMs"
+    | "configVersion"
   >;
   region: Pick<RegionConfig, "id" | "label" | "placementRegion" | "workerUrl">;
 }
@@ -67,6 +69,7 @@ export interface ProbeResult {
   id: string;
   runId: string;
   monitorId: string;
+  monitorConfigVersion: number;
   regionId: string;
   targetUrl: string;
   checkedAt: string;
@@ -92,6 +95,7 @@ export interface Summary {
   incidents: Incident[];
   runs: SchedulerRun[];
   usage: UsageSummary;
+  runtime: RuntimeSettings;
 }
 
 export interface LatestResult {
@@ -124,6 +128,7 @@ export interface UsageSummary {
   workerInvocations: number;
   queueMessages: number;
   d1Writes: number;
+  reservedProbes: number;
 }
 
 export interface SchedulerRun {
@@ -135,6 +140,25 @@ export interface SchedulerRun {
   skippedJobs: number;
   error: string | null;
   trigger: "scheduled" | "manual";
+}
+
+export interface RunStatus extends SchedulerRun {
+  storedResults: number;
+  successfulResults: number;
+  failedResults: number;
+  pendingResults: number;
+}
+
+export interface RuntimeSettings {
+  defaultDailyProbeBudget: number;
+  maxDailyProbes: number;
+  maxMonitorDailyBudget: number;
+  retentionDays: number;
+  probeBatchSize: number;
+  resultQueueBatchSize: number;
+  probeConcurrency: number;
+  dispatchConcurrency: number;
+  probeWorkerHostSuffix: string;
 }
 
 export type RuntimeEnv = Omit<
@@ -154,8 +178,14 @@ export type RuntimeEnv = Omit<
   DEFAULT_DAILY_PROBE_BUDGET?: string;
   DEFAULT_RETENTION_DAYS?: string;
   PROBE_BATCH_SIZE?: string;
+  RESULT_QUEUE_BATCH_SIZE?: string;
+  PROBE_CONCURRENCY?: string;
+  DISPATCH_CONCURRENCY?: string;
+  MAX_PROBE_RESPONSE_BYTES?: string;
+  MAX_DISPATCH_TIMEOUT_MS?: string;
   MAX_DAILY_PROBES?: string;
   MAX_MONITOR_DAILY_BUDGET?: string;
+  PROBE_WORKER_HOST_SUFFIX?: string;
   ALLOW_PRIVATE_TARGETS?: string;
   ALLOW_LOCAL_PROBES?: string;
   ARCHIVE_RAW_RESULTS?: string;

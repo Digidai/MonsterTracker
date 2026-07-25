@@ -25,8 +25,8 @@ for (const region of regions) {
     $schema: "../../node_modules/wrangler/config-schema.json",
     name: workerName,
     main: "../../src/index.ts",
-    compatibility_date: "2026-05-31",
-    compatibility_flags: ["nodejs_compat"],
+    compatibility_date: "2026-07-25",
+    compatibility_flags: ["nodejs_compat", "global_fetch_strictly_public"],
     observability: {
       enabled: true,
       head_sampling_rate: 0.1
@@ -39,6 +39,9 @@ for (const region of regions) {
       REGION_ID: region.id,
       REGION_LABEL: region.label,
       REGION_HINT: region.placementRegion,
+      PROBE_BATCH_SIZE: "5",
+      PROBE_CONCURRENCY: "6",
+      ALLOW_PRIVATE_TARGETS: "false",
       ALLOW_LOCAL_PROBES: "false"
     }
   };

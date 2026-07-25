@@ -2,7 +2,7 @@
   "$schema": "./node_modules/wrangler/config-schema.json",
   "name": "monstertracker-control",
   "main": "src/index.ts",
-  "compatibility_date": "2026-05-31",
+  "compatibility_date": "2026-07-25",
   "compatibility_flags": ["nodejs_compat", "global_fetch_strictly_public"],
   "assets": {
     "directory": "./dist/client",
@@ -20,9 +20,15 @@
     "REGION_PACK": "core",
     "DEFAULT_DAILY_PROBE_BUDGET": "100",
     "DEFAULT_RETENTION_DAYS": "30",
-    "PROBE_BATCH_SIZE": "50",
+    "PROBE_BATCH_SIZE": "5",
+    "RESULT_QUEUE_BATCH_SIZE": "5",
+    "PROBE_CONCURRENCY": "6",
+    "DISPATCH_CONCURRENCY": "6",
+    "MAX_PROBE_RESPONSE_BYTES": "512000",
+    "MAX_DISPATCH_TIMEOUT_MS": "130000",
     "MAX_DAILY_PROBES": "10000",
     "MAX_MONITOR_DAILY_BUDGET": "10000",
+    "PROBE_WORKER_HOST_SUFFIX": ".genedai.workers.dev",
     "ALLOW_LOCAL_PROBES": "false"
   },
   "d1_databases": [
@@ -55,7 +61,8 @@
       {
         "queue": "monstertracker-results",
         "max_batch_size": 1,
-        "max_batch_timeout": 5
+        "max_batch_timeout": 5,
+        "dead_letter_queue": "monstertracker-results-dlq"
       }
     ]
   },

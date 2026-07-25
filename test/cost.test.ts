@@ -3,9 +3,11 @@ import { estimateCost } from "../src/cost";
 
 describe("cost estimate", () => {
   it("keeps 10 URLs / 10,000 total probes per day in free quotas when batched", () => {
-    const estimate = estimateCost({ urlCount: 10, probesPerDay: 10_000, queueBatchSize: 50 });
+    const estimate = estimateCost({ urlCount: 10, probesPerDay: 10_000, queueBatchSize: 5 });
     expect(estimate.probesPerMonth).toBe(300_000);
-    expect(estimate.queueOperationsPerDay).toBe(600);
+    expect(estimate.averageProbesPerUrlPerDay).toBe(1_000);
+    expect(estimate.queueOperationsPerDay).toBe(8_640);
+    expect(estimate.workerRequestsPerDayWorstCase).toBe(14_320);
     expect(estimate.d1RowsWrittenPerDay).toBe(30_000);
     expect(estimate.recommendedPlan).toBe("free");
   });
@@ -14,5 +16,18 @@ describe("cost estimate", () => {
     const estimate = estimateCost({ urlCount: 10, probesPerDay: 100_001, queueBatchSize: 100 });
     expect(estimate.fitsWorkersFree).toBe(false);
     expect(estimate.recommendedPlan).toBe("workers-paid");
+  });
+
+  it("normalizes non-finite and non-positive public input", () => {
+    const estimate = estimateCost({
+      urlCount: Number.NaN,
+      probesPerDay: Number.NaN,
+      queueBatchSize: 0,
+      daysPerMonth: Number.POSITIVE_INFINITY
+    });
+    expect(estimate.urlCount).toBe(1);
+    expect(estimate.probesPerDay).toBe(0);
+    expect(estimate.probesPerMonth).toBe(0);
+    expect(estimate.queueOperationsPerDay).toBe(0);
   });
 });

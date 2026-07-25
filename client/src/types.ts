@@ -11,6 +11,7 @@ export interface MonitorConfig {
   timeoutMs: number;
   dailyBudget: number;
   enabled: boolean;
+  configVersion: number;
   tags: string[];
   createdAt: string;
   updatedAt: string;
@@ -49,6 +50,28 @@ export interface LatestResult {
   placement: string | null;
 }
 
+export interface ProbeResult {
+  id: string;
+  runId: string;
+  monitorId: string;
+  monitorConfigVersion: number;
+  regionId: string;
+  targetUrl: string;
+  checkedAt: string;
+  ok: boolean;
+  status: number | null;
+  latencyMs: number | null;
+  error: string | null;
+  method: MonitorMethod;
+  entryColo: string | null;
+  entryCountry: string | null;
+  entryCity: string | null;
+  entryAsn: number | null;
+  entryAsOrganization: string | null;
+  placement: string | null;
+  responseBytes: number;
+}
+
 export interface Incident {
   id: string;
   monitorId: string;
@@ -66,6 +89,7 @@ export interface UsageSummary {
   workerInvocations: number;
   queueMessages: number;
   d1Writes: number;
+  reservedProbes: number;
 }
 
 export interface SchedulerRun {
@@ -79,6 +103,13 @@ export interface SchedulerRun {
   trigger: "scheduled" | "manual";
 }
 
+export interface RunStatus extends SchedulerRun {
+  storedResults: number;
+  successfulResults: number;
+  failedResults: number;
+  pendingResults: number;
+}
+
 export interface Summary {
   generatedAt: string;
   monitors: MonitorConfig[];
@@ -87,11 +118,25 @@ export interface Summary {
   incidents: Incident[];
   runs: SchedulerRun[];
   usage: UsageSummary;
+  runtime: RuntimeSettings;
+}
+
+export interface RuntimeSettings {
+  defaultDailyProbeBudget: number;
+  maxDailyProbes: number;
+  maxMonitorDailyBudget: number;
+  retentionDays: number;
+  probeBatchSize: number;
+  resultQueueBatchSize: number;
+  probeConcurrency: number;
+  dispatchConcurrency: number;
+  probeWorkerHostSuffix: string;
 }
 
 export type ViewKey = "overview" | "monitors" | "regions" | "incidents" | "usage" | "placement" | "tokens";
-export type DetailTab = "overview" | "regions" | "alerts" | "settings";
-export type StatusFilter = "all" | "up" | "down" | "idle";
+export type DetailTab = "overview" | "history" | "regions" | "alerts" | "settings";
+export type MonitorStatus = "up" | "down" | "partial" | "stale" | "paused" | "idle";
+export type StatusFilter = "all" | MonitorStatus;
 
 export type MonitorConfigPatch = Partial<
   Pick<
