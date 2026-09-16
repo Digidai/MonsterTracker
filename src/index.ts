@@ -13,6 +13,7 @@ import {
   claimScheduledRunAndReserve,
   cleanupRetention,
   createMonitor,
+  deleteMonitor,
   expireStaleIncidents,
   getRunStatus,
   getSummary,
@@ -65,21 +66,27 @@ export default {
     await expireStaleIncidents(env);
     const baseUrl = env.PUBLIC_BASE_URL || "http://localhost:8787";
     const scheduledAt = event.scheduledTime ? new Date(event.scheduledTime) : new Date();
-    const monitors = applyGlobalDailyCap(await listMonitors(env), parsePositiveInt(env.MAX_DAILY_PROBES, 10_000));
+    let monitors = applyGlobalDailyCap(await listMonitors(env), parsePositiveInt(env.MAX_DAILY_PROBES, 10_000));
     const regions = await listRegions(env);
     const runId = scheduledRunId(scheduledAt);
-    const plan = buildSchedulePlan(monitors, regions, scheduledAt, runId);
+    let plan = buildSchedulePlan(monitors, regions, scheduledAt, runId);
+    const availableMonitorIds = new Set(monitors.map((monitor) => monitor.id));
     if (scheduledAt.getUTCMinutes() === 0) {
       ctx.waitUntil(cleanupRetention(env).catch((caught) => logBackgroundFailure("retention_cleanup_failed", caught)));
     }
     const recovered = await claimRecoverableSchedulerRun(env, (jobs) => {
-      // One recovery claim, two completion writes per run, and four statements
+      // One recovery claim, one monitor refresh, two completion writes per run, and four statements
       // for the new minute's claim/reservation. Check both runs before either
       // dispatches; a persistence chunk does not get a fresh invocation budget.
-      directPersistence.assertCapacity([jobs.length, plan.jobs.length], 3 + (plan.jobs.length ? 6 : 0));
+      const activeRecoveryJobs = jobs.filter((job) => availableMonitorIds.has(job.monitor.id));
+      directPersistence.assertCapacity([activeRecoveryJobs.length, plan.jobs.length], 4 + (plan.jobs.length ? 6 : 0));
     });
     if (recovered) {
-      await executeScheduledJobs(env, ctx, recovered, baseUrl);
+      await executeScheduledJobs(env, ctx, recovered, baseUrl, availableMonitorIds);
+      // Recovery may take minutes. Rebuild the new run from current visibility
+      // before reserving budget, so deletion during recovery also cancels it.
+      monitors = applyGlobalDailyCap(await listMonitors(env), parsePositiveInt(env.MAX_DAILY_PROBES, 10_000));
+      plan = buildSchedulePlan(monitors, regions, scheduledAt, runId);
     }
     if (!plan.jobs.length) return;
     directPersistence.assertCapacity([plan.jobs.length], 6);
@@ -120,10 +127,16 @@ async function executeScheduledJobs(
   env: RuntimeEnv,
   ctx: ExecutionContext,
   run: { id: string; startedAt: string; jobs: ProbeJob[] },
-  baseUrl: string
+  baseUrl: string,
+  availableMonitorIds?: Set<string>
 ): Promise<void> {
   try {
-    const outcome = await dispatchJobs(env, run.jobs, baseUrl);
+    // Preserve original result IDs when a recovery skips deleted monitors.
+    const jobs = run.jobs.map((job, index) => ({ ...job, jobId: job.jobId ?? `${job.runId}:${index}` }));
+    const active = jobs.filter((job) => !availableMonitorIds || availableMonitorIds.has(job.monitor.id));
+    const cancelledResultIds = jobs.filter((job) => availableMonitorIds && !availableMonitorIds.has(job.monitor.id))
+      .map((job) => `res_${job.jobId}`);
+    const outcome = await dispatchJobs(env, active, baseUrl);
     await persistResults(env, ctx, outcome.results);
     await recordSchedulerRunSafely(env, {
       id: run.id,
@@ -131,7 +144,8 @@ async function executeScheduledJobs(
       finishedAt: nowIso(),
       plannedJobs: run.jobs.length,
       dispatchedJobs: outcome.dispatchedJobs,
-      skippedJobs: Math.max(0, run.jobs.length - outcome.dispatchedJobs)
+      skippedJobs: Math.max(0, run.jobs.length - outcome.dispatchedJobs),
+      cancelledResultIds
     });
     await recordWorkerInvocationSafely(env, 1 + outcome.probeInvocations);
   } catch (caught) {
@@ -187,6 +201,18 @@ async function handleControlRequest(
   }
 
   const monitorMatch = /^\/api\/monitors\/([^/]+)$/.exec(url.pathname);
+  if (request.method === "DELETE" && monitorMatch?.[1]) {
+    const unauthorized = requireAdmin(request, env);
+    if (unauthorized) return unauthorized;
+    try {
+      await deleteMonitor(env, decodeURIComponent(monitorMatch[1]));
+      return Response.json({ deleted: true });
+    } catch (caught) {
+      if (caught instanceof Error && caught.message === "Monitor not found.") return jsonError(caught.message, 404);
+      throw caught;
+    }
+  }
+
   if (request.method === "GET" && monitorMatch?.[1]) {
     const unauthorized = requireAdmin(request, env);
     if (unauthorized) return unauthorized;

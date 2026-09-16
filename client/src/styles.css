@@ -6,6 +6,7 @@
 @import "@heroui/styles/utilities";
 @import "@heroui/styles/variants";
 @import "@heroui/styles/components/button.css" layer(components);
+@import "@heroui/styles/components/alert-dialog.css" layer(components);
 @import "@heroui/styles/components/card.css" layer(components);
 @import "@heroui/styles/components/chip.css" layer(components);
 @import "@heroui/styles/components/input.css" layer(components);
@@ -1205,6 +1206,18 @@ textarea:focus-visible {
 
 .detail-tabs {
   padding: 14px 18px 0;
+}
+
+.inspector-toolbar {
+  display: flex;
+  justify-content: flex-end;
+  padding: 12px 18px 0;
+}
+
+.delete-monitor-copy {
+  display: grid;
+  gap: 12px;
+  overflow-wrap: anywhere;
 }
 
 .detail-tabs [role="tablist"] {

@@ -123,6 +123,7 @@ Then create a monitor in the dashboard and click `Run due checks`.
 The dashboard can update D1-backed runtime configuration without redeploying:
 
 - Monitor settings: name, URL, method, expected status range, body match, timeout, daily budget, enabled state, and tags.
+- Monitor deletion: select a target in **Monitors**, then choose **Delete monitor** above the detail tabs and confirm. Deletion stops future scheduling and removes the target and its incidents from the dashboard. Historical records and archives follow their existing retention policies; in-flight checks may finish. There is no restore action. To pause temporarily, turn off **Enabled for scheduling** in Settings and save.
 - Region dispatch settings: `worker_url`, enabled state, and scheduling weight.
 - Manual validation: run the due schedule globally or sample a selected monitor across every enabled region after changing its configuration.
 - Run history: recent cron/manual scheduler runs are persisted in D1 for operational review.

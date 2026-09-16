@@ -5,6 +5,7 @@ import { EmptyState } from "@heroui-pro/react/empty-state";
 import { Segment } from "@heroui-pro/react/segment";
 
 import {
+  AlertDialog,
   Button,
   Card,
   Chip,
@@ -37,6 +38,7 @@ import {
   Settings2,
   ShieldCheck,
   Signal,
+  Trash2,
   X,
   Zap
 } from "lucide-react";
@@ -199,6 +201,8 @@ function App() {
   const historyAbort = useRef<AbortController | null>(null);
   const dirtyDrafts = useRef(new Set<string>());
   const [leaveAction, setLeaveAction] = useState<{ execute: () => void } | null>(null);
+  const [deleteTarget, setDeleteTarget] = useState<MonitorConfig | null>(null);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
   const [runFeedback, setRunFeedback] = useState<string | null>(null);
   const [pendingRunId, setPendingRunId] = useState<string | null>(null);
   const [draftGeneration, setDraftGeneration] = useState(0);
@@ -279,11 +283,11 @@ function App() {
   useEffect(() => {
     if (inspectorMode === "closed") return;
     const closeOnEscape = (event: KeyboardEvent) => {
-      if (event.key === "Escape" && !leaveAction) navigate(() => setInspectorMode("closed"));
+      if (event.key === "Escape" && !leaveAction && !deleteTarget) navigate(() => setInspectorMode("closed"));
     };
     window.addEventListener("keydown", closeOnEscape);
     return () => window.removeEventListener("keydown", closeOnEscape);
-  }, [inspectorMode, leaveAction, pendingAction]);
+  }, [inspectorMode, leaveAction, deleteTarget, pendingAction]);
 
   const data = useMemo(() => {
     if (!summary) return emptySummary;
@@ -467,6 +471,46 @@ function App() {
     }
   }
 
+  async function confirmMonitorDeletion() {
+    if (!deleteTarget || pendingAction) return;
+    const id = deleteTarget.id;
+    setPendingAction(`delete:${id}`);
+    setDeleteError(null);
+    try {
+      await requestJson(`/api/monitors/${encodeURIComponent(id)}`, { method: "DELETE" });
+      // A summary/history read started before deletion must not restore stale UI.
+      summaryRequestId.current += 1;
+      summaryAbort.current?.abort();
+      historyRequestId.current += 1;
+      historyAbort.current?.abort();
+      setHistory([]);
+      setHistoryError(null);
+      setHistoryLoading(false);
+      reportDirty(`monitor:${id}`, false);
+      setSummary((current) => current ? {
+        ...current,
+        monitors: current.monitors.filter((item) => item.id !== id),
+        latest: current.latest.filter((item) => item.monitorId !== id),
+        incidents: current.incidents.filter((item) => item.monitorId !== id)
+      } : current);
+      setSelectedMonitorId(null);
+      setInspectorMode("closed");
+      setDeleteTarget(null);
+      setView("monitors");
+      await loadSummary(token, false);
+      showToast("success", "Monitor deleted. No new checks will be scheduled.");
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Unable to delete monitor. Please retry.";
+      setDeleteError(message);
+      if (error instanceof ApiError && error.status === 401) {
+        setSummaryError("Verify your admin token to continue deleting this monitor.");
+        setAuthStatus("error");
+      }
+    } finally {
+      setPendingAction(null);
+    }
+  }
+
   async function saveMonitorConfig(id: string, patch: MonitorConfigPatch) {
     setPendingAction(`monitor:${id}`);
     try {
@@ -610,13 +654,16 @@ function App() {
     const failures = run?.failedResults ?? immediateFailures;
     const pending = run?.pendingResults ?? 0;
     const unknown = run?.unknownResults ?? immediateUnknown;
-    setRunFeedback(`${successes} passed · ${failures} target failures · ${unknown} unavailable probes · ${pending} pending.${pending > 0 ? " Results are still arriving. Recheck for the latest status." : ""}`);
+    const cancelled = run?.cancelledResults ?? 0;
+    setRunFeedback(`${successes} passed · ${failures} target failures · ${unknown} unavailable probes · ${pending} pending.${cancelled ? ` ${cancelled} skipped after monitor deletion.` : ""}${pending > 0 ? " Results are still arriving. Recheck for the latest status." : ""}`);
     if (pending > 0) {
       showToast("info", `${successes + failures + unknown} results stored; ${pending} still pending.`);
     } else if (failures > 0) {
       showToast("danger", `${successes} checks passed; ${failures} failed.`);
     } else if (unknown > 0) {
       showToast("info", `${unknown} probes unavailable; target status is unconfirmed.`);
+    } else if (cancelled > 0) {
+      showToast("info", `${successes} checks passed; ${cancelled} skipped after monitor deletion.`);
     } else {
       showToast("success", `${successes} checks passed and were stored.`);
     }
@@ -753,6 +800,7 @@ function App() {
           onTabChange={(tab) => { if (tab !== detailTab) navigate(() => setDetailTab(tab)); }}
           onMonitorSave={saveMonitorConfig}
           onMonitorRun={runMonitorSample}
+          onMonitorDelete={(monitor) => { setDeleteError(null); setDeleteTarget(monitor); }}
           onHistoryRetry={() => selectedMonitorId && loadMonitorHistory(selectedMonitorId)}
           onFormChange={(nextForm) => {
             setForm(nextForm);
@@ -762,6 +810,29 @@ function App() {
         />
       ) : null}
       {toast ? <Toast tone={toast.tone} message={toast.message} /> : null}
+      <AlertDialog.Backdrop isOpen={Boolean(deleteTarget) && sessionReady} isDismissable={false}
+        isKeyboardDismissDisabled={actionLoading}
+        onOpenChange={(open) => { if (!open && !actionLoading) setDeleteTarget(null); }}>
+        <AlertDialog.Container size="sm"><AlertDialog.Dialog>
+          <AlertDialog.Header>
+            <AlertDialog.Icon status="danger"><Trash2 size={20} /></AlertDialog.Icon>
+            <AlertDialog.Heading>Delete monitor?</AlertDialog.Heading>
+          </AlertDialog.Header>
+          <AlertDialog.Body className="delete-monitor-copy">
+            <p><strong>{deleteTarget?.name}</strong><br /><span className="field-note">{deleteTarget?.url}</span></p>
+            <p>This removes the monitor from your dashboard and stops future scheduled checks. Checks already in progress may finish.</p>
+            <p>Historical records remain subject to the existing retention policy. This cannot be undone. To pause instead, turn off “Enabled for scheduling” in Settings and save.</p>
+            {deleteTarget && dirtyDrafts.current.has(`monitor:${deleteTarget.id}`) ? <p>Unsaved changes to this monitor will also be discarded.</p> : null}
+            {deleteError ? <p className="notice-panel danger" role="alert">{deleteError}</p> : null}
+          </AlertDialog.Body>
+          <AlertDialog.Footer>
+            <Button autoFocus isDisabled={actionLoading} variant="secondary" onPress={() => setDeleteTarget(null)}>Cancel</Button>
+            <Button isDisabled={actionLoading} isPending={actionLoading} variant="danger" onPress={confirmMonitorDeletion}>
+              {actionLoading ? "Deleting…" : "Delete monitor"}
+            </Button>
+          </AlertDialog.Footer>
+        </AlertDialog.Dialog></AlertDialog.Container>
+      </AlertDialog.Backdrop>
       <Modal.Backdrop isOpen={!sessionReady && Boolean(summary)} isDismissable={false}>
         <Modal.Container size="sm"><Modal.Dialog>
           <Modal.Header><Modal.Heading>Verify admin access</Modal.Heading></Modal.Header>
@@ -1908,6 +1979,7 @@ function Inspector({
   onTabChange,
   onMonitorSave,
   onMonitorRun,
+  onMonitorDelete,
   onHistoryRetry,
   onFormChange,
   onCreate
@@ -1927,6 +1999,7 @@ function Inspector({
   onTabChange: (tab: DetailTab) => void;
   onMonitorSave: (id: string, patch: MonitorConfigPatch) => void | Promise<void>;
   onMonitorRun: (id: string) => void | Promise<void>;
+  onMonitorDelete: (monitor: MonitorConfig) => void;
   onHistoryRetry: () => void;
   onFormChange: (form: MonitorDraft) => void;
   onCreate: () => void;
@@ -1950,6 +2023,11 @@ function Inspector({
           </span>
         </div>
       </div>
+      {!creating && monitor ? <div className="inspector-toolbar">
+        <Button size="sm" variant="danger-soft" isDisabled={loading} onPress={() => onMonitorDelete(monitor)}>
+          <Trash2 size={15} />Delete monitor
+        </Button>
+      </div> : null}
       {creating ? (
         <AddMonitorForm
           enabledRegionCount={enabledRegionCount}

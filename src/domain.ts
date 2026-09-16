@@ -148,6 +148,7 @@ export interface SchedulerRun {
 }
 
 export interface RunStatus extends SchedulerRun {
+  cancelledResults: number;
   unknownResults: number;
   storedResults: number;
   successfulResults: number;

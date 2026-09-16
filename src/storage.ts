@@ -75,6 +75,7 @@ export interface RecordSchedulerRunInput {
   dispatchedJobs: number;
   skippedJobs: number;
   error?: string | null;
+  cancelledResultIds?: string[];
 }
 
 export async function bootstrapDefaults(env: RuntimeEnv): Promise<void> {
@@ -172,7 +173,7 @@ export async function updateMonitor(
   id: string,
   patch: UpdateMonitorInput
 ): Promise<MonitorConfig> {
-  const existing = await env.DB.prepare("SELECT * FROM monitors WHERE id = ?").bind(id).first<DbRow>();
+  const existing = await env.DB.prepare("SELECT * FROM monitors WHERE id = ? AND deleted_at IS NULL").bind(id).first<DbRow>();
   if (!existing) throw new Error("Monitor not found.");
   const current = mapMonitor(existing);
   const url =
@@ -223,7 +224,7 @@ export async function updateMonitor(
       config_version = ?,
       last_mutation_id = ?,
       updated_at = ?
-    WHERE id = ? AND config_version = ?`
+    WHERE id = ? AND config_version = ? AND deleted_at IS NULL`
   )
     .bind(
       name,
@@ -336,8 +337,25 @@ export async function updateRegion(
   };
 }
 
+export async function deleteMonitor(env: RuntimeEnv, id: string): Promise<void> {
+  const existing = await env.DB.prepare("SELECT id FROM monitors WHERE id = ?").bind(id).first<DbRow>();
+  if (!existing) throw new Error("Monitor not found.");
+  const now = nowIso();
+  // One transaction blocks stale edits and results before clearing visible state.
+  // Repeated DELETE requests succeed without advancing the configuration again.
+  await env.DB.batch([
+    env.DB.prepare(`UPDATE monitors SET deleted_at = ?, enabled = 0,
+      config_version = config_version + 1, last_mutation_id = ?, updated_at = ?
+      WHERE id = ? AND deleted_at IS NULL`).bind(now, createId("mut"), now, id),
+    env.DB.prepare("DELETE FROM monitor_latest WHERE monitor_id = ?").bind(id),
+    env.DB.prepare(`UPDATE incidents SET status = 'resolved', closed_at = ?,
+      expires_at = NULL, summary = 'Closed because the monitor was deleted; recovery was not verified'
+      WHERE monitor_id = ? AND status IN ('open', 'unknown')`).bind(now, id)
+  ]);
+}
+
 export async function listMonitors(env: RuntimeEnv): Promise<MonitorConfig[]> {
-  const result = await env.DB.prepare("SELECT * FROM monitors ORDER BY created_at DESC").all<DbRow>();
+  const result = await env.DB.prepare("SELECT * FROM monitors WHERE deleted_at IS NULL ORDER BY created_at DESC").all<DbRow>();
   return (result.results ?? []).map(mapMonitor);
 }
 
@@ -350,7 +368,9 @@ export async function listRegions(env: RuntimeEnv): Promise<RegionConfig[]> {
 
 export async function listLatest(env: RuntimeEnv): Promise<LatestResult[]> {
   const result = await env.DB.prepare(
-    "SELECT * FROM monitor_latest ORDER BY checked_at DESC"
+    `SELECT latest.* FROM monitor_latest AS latest
+     JOIN monitors AS monitor ON monitor.id = latest.monitor_id
+     WHERE monitor.deleted_at IS NULL ORDER BY latest.checked_at DESC`
   ).all<DbRow>();
   return (result.results ?? []).map(mapLatest);
 }
@@ -358,7 +378,10 @@ export async function listLatest(env: RuntimeEnv): Promise<LatestResult[]> {
 export async function listIncidents(env: RuntimeEnv, limit = 100): Promise<Incident[]> {
   const safeLimit = normalizeLimit(limit, 100, 500);
   const result = await env.DB.prepare(
-    "SELECT * FROM incidents ORDER BY (status IN ('open', 'unknown')) DESC, opened_at DESC LIMIT ?"
+    `SELECT incident.* FROM incidents AS incident
+     JOIN monitors AS monitor ON monitor.id = incident.monitor_id
+     WHERE monitor.deleted_at IS NULL
+     ORDER BY (incident.status IN ('open', 'unknown')) DESC, incident.opened_at DESC LIMIT ?`
   )
     .bind(safeLimit)
     .all<DbRow>();
@@ -367,7 +390,7 @@ export async function listIncidents(env: RuntimeEnv, limit = 100): Promise<Incid
 
 export async function listProbeResults(env: RuntimeEnv, monitorId: string, limit = 100): Promise<ProbeResult[]> {
   const safeLimit = normalizeLimit(limit, 100, 500);
-  const monitor = await env.DB.prepare("SELECT id FROM monitors WHERE id = ?").bind(monitorId).first<{ id: string }>();
+  const monitor = await env.DB.prepare("SELECT id FROM monitors WHERE id = ? AND deleted_at IS NULL").bind(monitorId).first<{ id: string }>();
   if (!monitor) throw new Error("Monitor not found.");
   const result = await env.DB.prepare(
     `SELECT * FROM probe_results
@@ -400,21 +423,25 @@ export async function getRunStatus(env: RuntimeEnv, id: string): Promise<RunStat
        COUNT(*) AS stored_results,
        SUM(CASE WHEN ok = 1 THEN 1 ELSE 0 END) AS successful_results,
        SUM(CASE WHEN ok = 0 AND result_type = 'target' THEN 1 ELSE 0 END) AS failed_results,
-       SUM(CASE WHEN result_type = 'infrastructure' THEN 1 ELSE 0 END) AS unknown_results
+       SUM(CASE WHEN result_type = 'infrastructure' THEN 1 ELSE 0 END) AS unknown_results,
+       (SELECT COUNT(*) FROM json_each(?) AS cancelled
+        WHERE NOT EXISTS (SELECT 1 FROM probe_results AS received WHERE received.id = cancelled.value)) AS cancelled_results
      FROM probe_results
      WHERE run_id = ?`
   )
-    .bind(id)
+    .bind(textField(runRow, "cancelled_result_ids_json") || "[]", id)
     .first<DbRow>();
   const run = mapSchedulerRun(runRow);
   const storedResults = numberField(counts ?? {}, "stored_results");
+  const cancelledResults = numberField(counts ?? {}, "cancelled_results");
   return {
     ...run,
     storedResults,
+    cancelledResults,
     successfulResults: numberField(counts ?? {}, "successful_results"),
     failedResults: numberField(counts ?? {}, "failed_results"),
     unknownResults: numberField(counts ?? {}, "unknown_results"),
-    pendingResults: run.error && run.finishedAt ? 0 : Math.max(0, run.plannedJobs - storedResults)
+    pendingResults: run.error && run.finishedAt ? 0 : Math.max(0, run.plannedJobs - storedResults - cancelledResults)
   };
 }
 
@@ -473,8 +500,8 @@ export function getRuntimeSettings(env: RuntimeEnv): RuntimeSettings {
 export async function recordSchedulerRun(env: RuntimeEnv, input: RecordSchedulerRunInput): Promise<void> {
   await env.DB.prepare(
     `INSERT INTO scheduler_runs (
-      id, started_at, finished_at, planned_jobs, dispatched_jobs, skipped_jobs, error
-    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+      id, started_at, finished_at, planned_jobs, dispatched_jobs, skipped_jobs, error, cancelled_result_ids_json
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(id) DO UPDATE SET
       started_at = excluded.started_at,
       finished_at = excluded.finished_at,
@@ -482,6 +509,7 @@ export async function recordSchedulerRun(env: RuntimeEnv, input: RecordScheduler
       dispatched_jobs = excluded.dispatched_jobs,
       skipped_jobs = excluded.skipped_jobs,
       error = excluded.error,
+      cancelled_result_ids_json = COALESCE(excluded.cancelled_result_ids_json, scheduler_runs.cancelled_result_ids_json),
       lease_expires_at = CASE WHEN excluded.finished_at IS NOT NULL THEN NULL ELSE scheduler_runs.lease_expires_at END`
   )
     .bind(
@@ -491,7 +519,8 @@ export async function recordSchedulerRun(env: RuntimeEnv, input: RecordScheduler
       input.plannedJobs,
       input.dispatchedJobs,
       input.skippedJobs,
-      input.error ?? null
+      input.error ?? null,
+      input.cancelledResultIds ? JSON.stringify(input.cancelledResultIds) : null
     )
     .run();
 }
@@ -688,7 +717,8 @@ async function saveProbeResultChunk(env: RuntimeEnv, results: ProbeResult[]): Pr
         SELECT result.monitor_id, result.region_id, result.id, result.checked_at, result.ok,
           result.status, result.latency_ms, result.error, result.entry_colo, result.placement, result.result_type
         FROM probe_results AS result JOIN monitors AS monitor ON monitor.id = result.monitor_id
-        WHERE result.id = ? AND monitor.enabled = 1 AND monitor.config_version = result.monitor_config_version
+        WHERE result.id = ? AND monitor.enabled = 1 AND monitor.deleted_at IS NULL
+          AND monitor.config_version = result.monitor_config_version
         ON CONFLICT(monitor_id, region_id) DO UPDATE SET
           result_id = excluded.result_id,
           checked_at = excluded.checked_at,
@@ -716,7 +746,7 @@ async function saveProbeResultChunk(env: RuntimeEnv, results: ProbeResult[]): Pr
           AND (? IS NOT NULL OR ? IS NOT NULL)
           AND EXISTS (
             SELECT 1 FROM monitors
-            WHERE id = ? AND enabled = 1 AND config_version = ?
+            WHERE id = ? AND enabled = 1 AND config_version = ? AND deleted_at IS NULL
           )`
       ).bind(
         result.entryColo,
@@ -880,6 +910,7 @@ async function updateIncidents(env: RuntimeEnv, monitorIds: string[]): Promise<v
       MIN(CASE WHEN latest.result_type = 'target' AND latest.ok = 0 AND latest.checked_at >= policy.cutoff
         THEN strftime('%Y-%m-%dT%H:%M:%fZ', julianday(latest.checked_at) + policy.freshness_ms / 86400000.0) END) AS expiry
     FROM json_each(?) AS requested
+    JOIN monitors AS monitor ON monitor.id = requested.value AND monitor.deleted_at IS NULL
     LEFT JOIN policies AS policy ON policy.monitor_id = requested.value
     LEFT JOIN monitor_latest AS latest ON latest.monitor_id = policy.monitor_id AND latest.region_id = policy.region_id
     GROUP BY requested.value

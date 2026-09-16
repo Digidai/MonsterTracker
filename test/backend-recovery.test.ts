@@ -223,7 +223,7 @@ describe("no-Queue invocation preflight", () => {
     await scheduled(db.env);
     expect(db.sqlite.prepare("SELECT count(*) n FROM probe_results").get()?.n).toBe(4);
     expect(db.sqlite.prepare("SELECT reserved_probes FROM daily_usage").get()?.reserved_probes).toBe(4);
-    expect(db.count()).toBe(45);
+    expect(db.count()).toBe(46); // includes monitor visibility refresh after recovery
   });
 
   it("keeps ten-result Queue consumers at forty statements", async () => {
