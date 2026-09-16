@@ -1963,11 +1963,6 @@ function Inspector({
           </span>
         </div>
       </div>
-      {!creating && monitor ? <div className="inspector-toolbar">
-        <Button size="sm" variant="danger-soft" isDisabled={loading} onPress={() => onMonitorDelete(monitor)}>
-          <Trash2 size={15} />Delete monitor
-        </Button>
-      </div> : null}
       {creating ? (
         <AddMonitorForm
           enabledRegionCount={enabledRegionCount}
@@ -2023,6 +2018,7 @@ function Inspector({
               monitor={monitor}
               onMonitorSave={onMonitorSave}
               onMonitorRun={onMonitorRun}
+              onMonitorDelete={onMonitorDelete}
             />
           </Tabs.Panel>
         </Tabs>
@@ -2162,7 +2158,8 @@ function SettingsPanel({
   maxDailyBudget,
   enabledRegionCount,
   onMonitorSave,
-  onMonitorRun
+  onMonitorRun,
+  onMonitorDelete
 }: {
   monitor: MonitorConfig | null;
   loading: boolean;
@@ -2170,6 +2167,7 @@ function SettingsPanel({
   enabledRegionCount: number;
   onMonitorSave: (id: string, patch: MonitorConfigPatch) => void | Promise<void>;
   onMonitorRun: (id: string) => void | Promise<void>;
+  onMonitorDelete: (monitor: MonitorConfig) => void;
 }) {
   return (
     <div className="settings-panel">
@@ -2183,6 +2181,13 @@ function SettingsPanel({
           onSave={onMonitorSave}
         />
       ) : null}
+      {monitor ? <section className="monitor-delete-section" aria-label="Delete monitor">
+        <h3>Delete monitor</h3>
+        <p>Stop future checks and remove this monitor from the dashboard. To stop checks temporarily, pause scheduling above.</p>
+        <Button size="sm" type="button" variant="danger-soft" isDisabled={loading} onPress={() => onMonitorDelete(monitor)}>
+          <Trash2 size={15} />Delete monitor
+        </Button>
+      </section> : null}
     </div>
   );
 }

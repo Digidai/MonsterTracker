@@ -2,7 +2,7 @@
 
 ## Behavior
 
-Select a monitor in Monitors and choose **Delete monitor** above its detail tabs. A HeroUI AlertDialog names the target, explains retained history and in-flight checks, and offers Cancel before the destructive action. Cancel preserves drafts. Success clears selection, history and visible incidents; failure keeps the confirmation open with a retryable error. Expired authorization prompts for a token before retrying.
+Select a monitor in Monitors, open its **Settings** tab and choose **Delete monitor** at the bottom, separated from the configuration form. A HeroUI AlertDialog names the target, explains retained history and in-flight checks, and offers Cancel before the destructive action. Cancel preserves drafts. Success clears selection, history and visible incidents; failure keeps the confirmation open with a retryable error. Expired authorization prompts for a token before retrying.
 
 ## Data and concurrency
 

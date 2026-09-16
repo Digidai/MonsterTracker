@@ -1241,10 +1241,23 @@ textarea:focus-visible {
   padding: 14px 18px 0;
 }
 
-.inspector-toolbar {
-  display: flex;
-  justify-content: flex-end;
-  padding: 12px 18px 0;
+.monitor-delete-section {
+  border-top: 1px solid #e1e8e4;
+  margin-top: 24px;
+  padding: 20px 0;
+}
+
+.monitor-delete-section h3 {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.monitor-delete-section p {
+  margin: 8px 0 14px;
+  color: #667371;
+  font-size: 12px;
+  line-height: 1.6;
 }
 
 .delete-monitor-copy {
