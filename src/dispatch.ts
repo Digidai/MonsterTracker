@@ -18,6 +18,7 @@ const MAX_OUTGOING_CONCURRENCY = 6;
 const DEFAULT_MAX_RESPONSE_BYTES = 512_000;
 
 export async function dispatchJobs(env: RuntimeEnv, jobs: ProbeJob[], origin: string): Promise<DispatchOutcome> {
+  jobs = jobs.map((job, index) => ({ ...job, jobId: job.jobId ?? `${job.runId}:${index}` }));
   const groups = new Map<string, ProbeJob[]>();
   const batchSize = Math.min(5, parsePositiveInt(env.PROBE_BATCH_SIZE, 5));
   const immediateResults: ProbeResult[] = [];
@@ -105,7 +106,8 @@ export function reconcileProbeResults(jobs: ProbeJob[], candidates: unknown): Pr
 
 export function dispatchErrorResult(job: ProbeJob, error: string): ProbeResult {
   return {
-    id: createId("res"),
+    resultType: "infrastructure",
+    id: job.jobId ? `res_${job.jobId}` : createId("res"),
     runId: job.runId,
     monitorId: job.monitor.id,
     monitorConfigVersion: job.monitor.configVersion,
@@ -242,7 +244,8 @@ function sanitizeProbeResult(job: ProbeJob, input: unknown): ProbeResult | null 
   }
 
   return {
-    id,
+    id: job.jobId ? `res_${job.jobId}` : id,
+    resultType: "target",
     runId: job.runId,
     monitorId: job.monitor.id,
     monitorConfigVersion: job.monitor.configVersion,

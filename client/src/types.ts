@@ -1,6 +1,7 @@
 export type MonitorMethod = "HEAD" | "GET";
 
 export interface MonitorConfig {
+  effectiveDailyBudget?: number;
   id: string;
   name: string;
   url: string;
@@ -38,6 +39,7 @@ export interface RegionConfig {
 }
 
 export interface LatestResult {
+  resultType?: "target" | "infrastructure";
   monitorId: string;
   regionId: string;
   resultId: string;
@@ -51,6 +53,7 @@ export interface LatestResult {
 }
 
 export interface ProbeResult {
+  resultType?: "target" | "infrastructure";
   id: string;
   runId: string;
   monitorId: string;
@@ -104,6 +107,7 @@ export interface SchedulerRun {
 }
 
 export interface RunStatus extends SchedulerRun {
+  unknownResults: number;
   storedResults: number;
   successfulResults: number;
   failedResults: number;
@@ -135,7 +139,8 @@ export interface RuntimeSettings {
 
 export type ViewKey = "overview" | "monitors" | "regions" | "incidents" | "usage" | "placement" | "tokens";
 export type DetailTab = "overview" | "history" | "regions" | "alerts" | "settings";
-export type MonitorStatus = "up" | "down" | "partial" | "stale" | "paused" | "idle";
+export type { MonitorStatus } from "../../src/health";
+import type { MonitorStatus } from "../../src/health";
 export type StatusFilter = "all" | MonitorStatus;
 
 export type MonitorConfigPatch = Partial<

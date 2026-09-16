@@ -4,6 +4,8 @@ Cloudflare-native website monitoring built on Workers, D1, Queues, R2, Analytics
 
 MonsterTracker deliberately does **not** use Cloudflare Health Checks. It runs your own probe Workers and distributes a daily probe budget across placed regions.
 
+See the [September 2026 upgrade and verification report](docs/plans/2026-09-16-product-upgrade.md) for the current release, review evidence, and remaining limitations.
+
 ## What It Can And Cannot Promise
 
 MonsterTracker can:
@@ -11,7 +13,7 @@ MonsterTracker can:
 - Run HTTP/HTTPS checks from many Cloudflare Workers with `placement.region` hints.
 - Rotate a daily probe budget across regions, for example `10 URLs / 10,000 probes per day`.
 - Record Cloudflare edge metadata such as colo, country, ASN, and `cf-placement`.
-- Stay inside Cloudflare Free quotas for small and medium self-hosted deployments.
+- Control probe volume and estimate platform usage; validate Free quota fit against Cloudflare's metered usage.
 
 MonsterTracker cannot:
 
@@ -52,7 +54,7 @@ minute quota = floor((minute + 1) * daily_budget / 1440)
 ```
 
 When all minute Cron Triggers run, this produces exactly the configured daily
-budget over a UTC day. Missed Cron Triggers are recorded but are not replayed.
+budget over a UTC day. Missed Cron Triggers are not replayed. Empty minutes do not create run records.
 Region `weight` changes only the deterministic region rotation. It does not
 increase the monitor budget; a region with weight `3` receives about three times
 the scheduled probes of a region with weight `1`.
@@ -63,16 +65,16 @@ For `10 URLs / 10,000 total probes per day`:
 
 | Item | Daily Use | Free Quota Fit |
 |---|---:|---|
-| Worker invocations, conservative | about 14,320 | yes, Free has 100,000/day |
+| Worker invocations, conservative | about 12,440 | yes, Free has 100,000/day |
 | Worker outbound fetches | 10,000 | not billed as separate subrequests |
 | Analytics Engine points | 10,000 | yes, Free has 100,000/day |
-| D1 writes | about 30,000/day before index overhead | yes, Free has 100,000 writes/day |
-| Queue operations | about 8,640/day with 5-result, minute-bounded batches | yes, with limited headroom below 10,000/day |
+| D1 writes | 30,000 logical primary writes/day | not a billing estimate; measure index and operational writes |
+| Queue operations | about 3,000/day with 10-result batches | baseline excludes retries and messages over 64 KB |
 | R2 archive | MB-level | yes, Free includes 10 GB-month |
 
 MonsterTracker writes about three D1 rows/statements per probe in the default raw-results mode: raw result, latest result, and region calibration. For 10,000 probes/day, budget around 30,000 D1 writes/day before index overhead and incident updates.
 
-Expected Cloudflare bill: **$0/month** for this workload when the default 5-result Queue batch is retained and all Free Worker, Cron, D1, Queue, Analytics Engine, and R2 limits remain available. Queue capacity is the closest limit in this example.
+Free-tier feasibility must be verified from Cloudflare metered usage. Queue capacity is improved, but D1 index maintenance, acknowledgements, incidents, retention and scheduling add writes beyond application counters. The cost API returns `verify-d1` instead of promising a zero bill.
 
 Free-tier deployments should keep the core region pack unless they understand the subrequest limit. The control Worker makes one outbound request per active probe Worker in a scheduler invocation. Core uses 24 regions; extended uses more than 50 and is meant for Workers Paid or future sharded dispatch.
 
@@ -81,18 +83,22 @@ The committed control Worker config includes `global_fetch_strictly_public`. Clo
 Use the built-in estimator:
 
 ```bash
-curl "http://localhost:8787/api/cost?urls=10&probesPerDay=10000&queueBatchSize=5"
+curl "http://localhost:8787/api/cost?urls=10&probesPerDay=10000&queueBatchSize=10"
 ```
 
 ## Local Development
 
 ```bash
-npm install
+npm ci --ignore-scripts
+npx heroui-pro login
+npx heroui-pro install react --yes
 npm run types
 npm run db:migrate:local
 ```
 
-The dashboard is a Vite React app built with HeroUI components. `npm run dev`
+The dashboard is a Vite React app using HeroUI Pro Sidebar, Segment and EmptyState with HeroUI base controls. A HeroUI Pro license is required to build this frontend. The application code is MIT; the proprietary dependency is separately licensed and is not included in the repository. For local automated installs use `HEROUI_PERSONAL_TOKEN`; for trusted CI use `HEROUI_AUTH_TOKEN` from a protected secret. Never put either token in a `VITE_` variable. See [HeroUI installation](https://heroui.pro/docs/react/getting-started/installation) and [license terms](https://heroui.pro/terms).
+
+`npm run dev`
 builds the dashboard assets first and then starts Wrangler with the static
 assets binding:
 
@@ -110,7 +116,7 @@ SHARED_SECRET=dev-shared-secret
 PUBLIC_BASE_URL=http://localhost:8787
 ```
 
-Then create a monitor in the dashboard and click `Run Due Now`.
+Then create a monitor in the dashboard and click `Run due checks`.
 
 ## Runtime Configuration
 
@@ -121,12 +127,14 @@ The dashboard can update D1-backed runtime configuration without redeploying:
 - Manual validation: run the due schedule globally or sample a selected monitor across every enabled region after changing its configuration.
 - Run history: recent cron/manual scheduler runs are persisted in D1 for operational review.
 - Probe history: the inspector loads the latest 100 raw results for the selected monitor.
-- Incident history: open and resolved incidents remain visible until retention cleanup.
-- Freshness states: the dashboard distinguishes current failures from stale or never-seen data.
+- Incident history: open, unconfirmed and resolved incidents remain visible until retention cleanup. Missing evidence never implies recovery.
+- Freshness states: target failure, unavailable probes, incomplete regional coverage, stale evidence and paused monitors are separate states.
+- Safe editing: unsaved changes are protected during navigation and preserved through token reauthentication. Save errors remain next to the form.
+- Efficient reads: history is loaded only when its tab is opened; superseded requests are canceled. Static assets bypass Worker execution.
 
 Secrets and Worker environment variables are intentionally not editable from the dashboard. Keep `ADMIN_TOKEN`, `SHARED_SECRET`, and deployment bindings managed through Wrangler and `wrangler.jsonc`.
 
-`Run Due Now` only executes work due in the current UTC minute. It does not
+`Run due checks` only executes work due in the current UTC minute. It shares the UTC-minute claim with Cron and never reserves the same minute twice. It does not
 fall back to an unscheduled sample. Use the monitor inspector's regional sample
 action when you intentionally want one probe from every enabled region.
 
@@ -157,7 +165,7 @@ npm run db:migrate:remote
 npm run deploy
 ```
 
-For upgrades, deploy the generated probe fleet first, then apply D1 migrations and deploy the control Worker. The protocol accepts legacy probe responses during that rolling window, but probe-first keeps every region on the newest timeout and validation behavior before the control plane begins sending new fields.
+For upgrades, deploy the generated probe fleet first, then apply D1 migrations and deploy the control Worker. This control-only upgrade accepts existing probe responses. The protocol accepts legacy probe responses during a rolling window, but probe-first keeps every region on the newest timeout and validation behavior before the control plane begins sending new fields.
 
 For production, keep `ALLOW_LOCAL_PROBES=false`. Regional probes must be reached through `regions.worker_url` or `PROBE_URL_TEMPLATE`.
 
@@ -214,7 +222,7 @@ Important variables:
 | `REGION_PACK` | `core` or `extended` default seed regions |
 | `DEFAULT_DAILY_PROBE_BUDGET` | Default per-monitor daily probes |
 | `PROBE_BATCH_SIZE` | Jobs per control-to-probe HTTP request |
-| `RESULT_QUEUE_BATCH_SIZE` | Results per Queue message, capped at 5 for D1 Free query safety |
+| `RESULT_QUEUE_BATCH_SIZE` | Results per Queue message, capped at 10; real SQLite regression verifies 40 total consumer queries against the Free limit of 50 |
 | `PROBE_CONCURRENCY` | Concurrent target requests inside a probe Worker, capped at 6 |
 | `DISPATCH_CONCURRENCY` | Concurrent control-to-probe requests, capped at 6 |
 | `MAX_PROBE_RESPONSE_BYTES` | Maximum accepted probe Worker response size |

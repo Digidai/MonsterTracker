@@ -1,11 +1,15 @@
-import "@heroui/react/styles";
 import "./styles.css";
+
+import { Sidebar as ProSidebar } from "@heroui-pro/react/sidebar";
+import { EmptyState } from "@heroui-pro/react/empty-state";
+import { Segment } from "@heroui-pro/react/segment";
 
 import {
   Button,
   Card,
   Chip,
   Input,
+  Modal,
   ProgressBar,
   Surface,
   Tabs
@@ -24,7 +28,7 @@ import {
   KeyRound,
   ListFilter,
   LockKeyhole,
-  MapPinned,
+  LogOut,
   Play,
   Plus,
   RefreshCw,
@@ -33,11 +37,14 @@ import {
   Settings2,
   ShieldCheck,
   Signal,
-  Trash2,
+  X,
   Zap
 } from "lucide-react";
 import {
   Component,
+  createContext,
+  useContext,
+  useCallback,
   type ErrorInfo,
   type FormEvent,
   type Key,
@@ -67,6 +74,17 @@ import type {
   ViewKey
 } from "./types";
 
+import { applyGlobalDailyCap } from "../../src/budget";
+import { estimateCost } from "../../src/cost";
+import { monitorStatus, isRegionResultStale } from "../../src/health";
+
+const DirtyContext = createContext<(key: string, dirty: boolean) => void>(() => {});
+const NavigateContext = createContext<(action: () => void) => void>((action) => action());
+function useDirtyDraft(key: string, dirty: boolean) {
+  const report = useContext(DirtyContext);
+  useEffect(() => { report(key, dirty); return () => report(key, false); }, [key, dirty, report]);
+}
+
 interface MonitorDraft {
   url: string;
   name: string;
@@ -79,15 +97,19 @@ interface MonitorDraft {
   tags: string;
 }
 
-const navItems: Array<{ key: ViewKey; label: string; icon: typeof Activity }> = [
+const primaryNavItems: Array<{ key: ViewKey; label: string; icon: typeof Activity }> = [
   { key: "overview", label: "Overview", icon: Activity },
   { key: "monitors", label: "Monitors", icon: Server },
   { key: "regions", label: "Regions", icon: Globe2 },
-  { key: "incidents", label: "Incidents", icon: AlertTriangle },
-  { key: "usage", label: "Usage", icon: BarChart3 },
-  { key: "placement", label: "Placement", icon: MapPinned },
-  { key: "tokens", label: "Tokens", icon: KeyRound }
+  { key: "incidents", label: "Incidents", icon: AlertTriangle }
 ];
+
+const systemNavItems: Array<{ key: ViewKey; label: string; icon: typeof Activity }> = [
+  { key: "usage", label: "Usage", icon: BarChart3 },
+  { key: "tokens", label: "Settings", icon: Settings2 }
+];
+
+const navItems = [...primaryNavItems, ...systemNavItems];
 
 const detailTabs: Array<{ key: DetailTab; label: string }> = [
   { key: "overview", label: "Overview" },
@@ -101,6 +123,7 @@ const validViews = new Set<ViewKey>(navItems.map((item) => item.key));
 const validDetailTabs = new Set<DetailTab>(detailTabs.map((item) => item.key));
 
 type AuthStatus = "locked" | "verifying" | "authenticated" | "error";
+type InspectorMode = "closed" | "detail" | "create";
 
 class ApiError extends Error {
   constructor(message: string, readonly status: number) {
@@ -158,6 +181,7 @@ function App() {
   const [summary, setSummary] = useState<Summary | null>(null);
   const [summaryError, setSummaryError] = useState<string | null>(null);
   const [selectedMonitorId, setSelectedMonitorId] = useState<string | null>(null);
+  const [inspectorMode, setInspectorMode] = useState<InspectorMode>("closed");
   const [query, setQuery] = useState("");
   const [statusFilter, setStatusFilter] = useState<StatusFilter>("all");
   const [refreshing, setRefreshing] = useState(false);
@@ -167,9 +191,37 @@ function App() {
   const [historyError, setHistoryError] = useState<string | null>(null);
   const [toast, setToast] = useState<{ tone: "success" | "danger" | "info"; message: string } | null>(null);
   const [form, setForm] = useState<MonitorDraft>(defaultMonitorDraft);
+  const [createError, setCreateError] = useState<string | null>(null);
   const summaryRequestId = useRef(0);
   const historyRequestId = useRef(0);
   const tokenVerificationId = useRef(0);
+  const summaryAbort = useRef<AbortController | null>(null);
+  const historyAbort = useRef<AbortController | null>(null);
+  const dirtyDrafts = useRef(new Set<string>());
+  const [leaveAction, setLeaveAction] = useState<{ execute: () => void } | null>(null);
+  const [runFeedback, setRunFeedback] = useState<string | null>(null);
+  const [pendingRunId, setPendingRunId] = useState<string | null>(null);
+  const [draftGeneration, setDraftGeneration] = useState(0);
+  const reportDirty = useCallback((key: string, dirty: boolean) => {
+    if (dirty) dirtyDrafts.current.add(key); else dirtyDrafts.current.delete(key);
+  }, []);
+
+  function navigate(action: () => void) {
+    if (pendingAction) return;
+    if (dirtyDrafts.current.size) setLeaveAction({ execute: action }); else action();
+  }
+
+  useEffect(() => {
+    const preventLoss = (event: BeforeUnloadEvent) => {
+      if (dirtyDrafts.current.size) event.preventDefault();
+    };
+    window.addEventListener("beforeunload", preventLoss);
+    return () => window.removeEventListener("beforeunload", preventLoss);
+  }, []);
+
+  useEffect(() => {
+    reportDirty("create", inspectorMode === "create" && JSON.stringify(form) !== JSON.stringify(defaultMonitorDraft));
+  }, [form, inspectorMode, reportDirty]);
 
   useEffect(() => {
     sessionStorage.setItem("monstertracker.view", view);
@@ -206,14 +258,17 @@ function App() {
   }, [authStatus, token, pendingAction]);
 
   useEffect(() => {
-    if (authStatus !== "authenticated" || !token.trim() || !selectedMonitorId) {
+    if (authStatus !== "authenticated" || !token.trim() || !selectedMonitorId || inspectorMode !== "detail" || detailTab !== "history") {
+      historyRequestId.current += 1;
+      historyAbort.current?.abort();
       setHistory([]);
       setHistoryError(null);
       return;
     }
     void loadMonitorHistory(selectedMonitorId, token);
+    return () => { historyRequestId.current += 1; historyAbort.current?.abort(); };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [authStatus, selectedMonitorId, token]);
+  }, [authStatus, selectedMonitorId, token, inspectorMode, detailTab]);
 
   useEffect(() => {
     if (!toast) return;
@@ -221,9 +276,24 @@ function App() {
     return () => window.clearTimeout(timeout);
   }, [toast]);
 
-  const data = summary || emptySummary;
+  useEffect(() => {
+    if (inspectorMode === "closed") return;
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && !leaveAction) navigate(() => setInspectorMode("closed"));
+    };
+    window.addEventListener("keydown", closeOnEscape);
+    return () => window.removeEventListener("keydown", closeOnEscape);
+  }, [inspectorMode, leaveAction, pendingAction]);
+
+  const data = useMemo(() => {
+    if (!summary) return emptySummary;
+    const effective = applyGlobalDailyCap(summary.monitors, summary.runtime.maxDailyProbes);
+    return { ...summary, monitors: summary.monitors.map((monitor, index) => ({
+      ...monitor, effectiveDailyBudget: monitor.enabled ? effective[index]?.dailyBudget ?? 0 : 0
+    })) };
+  }, [summary]);
   const latestByMonitor = useMemo(() => groupLatest(data.latest), [data.latest]);
-  const selectedMonitor = data.monitors.find((monitor) => monitor.id === selectedMonitorId) || data.monitors[0] || null;
+  const selectedMonitor = data.monitors.find((monitor) => monitor.id === selectedMonitorId) || null;
   const enabledRegionIds = new Set(data.regions.filter((region) => region.enabled).map((region) => region.id));
   const selectedLatest = selectedMonitor
     ? (latestByMonitor.get(selectedMonitor.id) || []).filter((item) => enabledRegionIds.has(item.regionId))
@@ -235,11 +305,12 @@ function App() {
   );
   const actionLoading = pendingAction !== null;
   const sessionReady = authStatus === "authenticated";
-  const openIncidentCount = data.incidents.filter((incident) => incident.status === "open").length;
+  const openIncidentCount = data.incidents.filter((incident) => incident.status !== "resolved").length;
 
   async function requestJson<T>(path: string, init: RequestInit = {}, authToken = token): Promise<T> {
     const response = await fetch(path, {
       ...init,
+      signal: init.signal ? AbortSignal.any([init.signal, AbortSignal.timeout(30_000)]) : AbortSignal.timeout(path === "/api/run" ? 300_000 : 30_000),
       headers: {
         Accept: "application/json",
         Authorization: `Bearer ${authToken.trim()}`,
@@ -247,7 +318,8 @@ function App() {
         ...init.headers
       }
     });
-    const body = (await response.json().catch(() => ({}))) as { error?: string };
+    // An aborted or malformed successful body is not a valid empty payload.
+    const body = (await response.json()) as { error?: string };
     if (!response.ok) {
       throw new ApiError(body.error || `Request failed: ${response.status}`, response.status);
     }
@@ -262,13 +334,14 @@ function App() {
     }
     const requestId = summaryRequestId.current + 1;
     summaryRequestId.current = requestId;
+    summaryAbort.current?.abort();
+    summaryAbort.current = new AbortController();
     setRefreshing(true);
     try {
-      const next = await requestJson<Summary>("/api/summary", {}, authToken);
+      const next = await requestJson<Summary>("/api/summary", { signal: summaryAbort.current.signal }, authToken);
       if (requestId !== summaryRequestId.current) return;
       setSummary(next);
       setSummaryError(null);
-      if (!selectedMonitorId && next.monitors[0]) setSelectedMonitorId(next.monitors[0].id);
       if (notify) showToast("success", "Summary refreshed.");
       return true;
     } catch (error) {
@@ -276,7 +349,7 @@ function App() {
       const message = error instanceof Error ? error.message : "Failed to refresh.";
       setSummaryError(message);
       if (error instanceof ApiError && error.status === 401) setAuthStatus("error");
-      showToast("danger", message);
+      if (notify || Boolean(summary)) showToast("danger", message);
       if (!summary) setView("tokens");
       return false;
     } finally {
@@ -287,13 +360,15 @@ function App() {
   async function loadMonitorHistory(monitorId: string, authToken = token) {
     const requestId = historyRequestId.current + 1;
     historyRequestId.current = requestId;
+    historyAbort.current?.abort();
+    historyAbort.current = new AbortController();
     setHistoryLoading(true);
     setHistory([]);
     setHistoryError(null);
     try {
       const body = await requestJson<{ results: ProbeResult[] }>(
         `/api/monitors/${encodeURIComponent(monitorId)}?limit=100`,
-        {},
+        { signal: historyAbort.current.signal },
         authToken
       );
       if (requestId === historyRequestId.current) setHistory(body.results);
@@ -316,6 +391,8 @@ function App() {
         summaryRequestId.current += 1;
         historyRequestId.current += 1;
         tokenVerificationId.current += 1;
+        summaryAbort.current?.abort();
+        historyAbort.current?.abort();
         sessionStorage.removeItem("monstertracker.adminToken");
         setToken("");
         setAuthStatus("locked");
@@ -324,6 +401,7 @@ function App() {
         setSelectedMonitorId(null);
         setHistory([]);
         setHistoryError(null);
+        setInspectorMode("closed");
         setView("tokens");
         showToast("info", "Admin token cleared.");
         return;
@@ -341,6 +419,7 @@ function App() {
     const verificationId = tokenVerificationId.current + 1;
     tokenVerificationId.current = verificationId;
     setAuthStatus("verifying");
+    if (!summary) setSummaryError(null);
     const verified = await loadSummary(candidate, false);
     if (verificationId !== tokenVerificationId.current) return false;
     if (!verified) {
@@ -351,33 +430,38 @@ function App() {
     setToken(candidate);
     sessionStorage.setItem("monstertracker.adminToken", candidate);
     setAuthStatus("authenticated");
+    setView((current) => current === "tokens" ? "overview" : current);
     return true;
   }
 
   async function createMonitor() {
     if (!form.url.trim()) {
-      showToast("danger", "URL is required.");
+      setCreateError("URL is required.");
       return;
     }
     const parsed = parseMonitorForm(form, data.runtime.maxMonitorDailyBudget);
     if (!parsed.ok) {
-      showToast("danger", parsed.error);
+      setCreateError(parsed.error);
       return;
     }
+    setCreateError(null);
     setPendingAction("create-monitor");
     try {
       const body = await requestJson<{ monitor: MonitorConfig }>("/api/monitors", {
         method: "POST",
         body: JSON.stringify(parsed.patch)
       });
+      setSummary((current) => current ? { ...current, monitors: [body.monitor, ...current.monitors] } : current);
       setSelectedMonitorId(body.monitor.id);
-      setView("overview");
+      setView("monitors");
       setDetailTab("overview");
+      setInspectorMode("detail");
       setForm(defaultMonitorDraft);
+      setCreateError(null);
       await loadSummary(token, false);
       showToast("success", "Monitor created.");
     } catch (error) {
-      showToast("danger", error instanceof Error ? error.message : "Create failed.");
+      setCreateError(error instanceof Error ? error.message : "Create failed.");
     } finally {
       setPendingAction(null);
     }
@@ -391,11 +475,19 @@ function App() {
         body: JSON.stringify(patch)
       });
       setSelectedMonitorId(body.monitor.id);
+      reportDirty(`monitor:${id}`, false);
+      setSummary((current) => current ? {
+        ...current,
+        monitors: current.monitors.map((item) => item.id === id ? body.monitor : item),
+        // Until refresh confirms the new configuration, do not attach old evidence to it.
+        latest: current.latest.filter((item) => item.monitorId !== id)
+      } : current);
       await loadSummary(token, false);
-      await loadMonitorHistory(id);
+      if (detailTab === "history") await loadMonitorHistory(id);
       showToast("success", "Monitor configuration saved.");
     } catch (error) {
       showToast("danger", error instanceof Error ? error.message : "Monitor update failed.");
+      throw error;
     } finally {
       setPendingAction(null);
     }
@@ -404,21 +496,26 @@ function App() {
   async function saveRegionConfig(id: string, patch: RegionConfigPatch) {
     setPendingAction(`region:${id}`);
     try {
-      await requestJson<{ region: RegionConfig }>(`/api/regions/${encodeURIComponent(id)}`, {
+      const body = await requestJson<{ region: RegionConfig }>(`/api/regions/${encodeURIComponent(id)}`, {
         method: "PATCH",
         body: JSON.stringify(patch)
       });
+      reportDirty(`region:${id}`, false);
+      setSummary((current) => current ? { ...current, regions: current.regions.map((item) => item.id === id ? body.region : item) } : current);
       await loadSummary(token, false);
       showToast("success", "Region configuration saved.");
     } catch (error) {
       showToast("danger", error instanceof Error ? error.message : "Region update failed.");
+      throw error;
     } finally {
       setPendingAction(null);
     }
   }
 
   async function runDueNow() {
+    setPendingRunId(null);
     setPendingAction("run-due");
+    setRunFeedback("Running checks due in the current minute…");
     try {
       const body = await requestJson<{
         runId: string;
@@ -426,23 +523,28 @@ function App() {
         dispatchedJobs: number;
         successfulJobs: number;
         failedJobs: number;
+        unknownJobs: number;
         queued: boolean;
-        reason: "no_due_jobs" | "no_enabled_regions" | null;
+        reason: "no_due_jobs" | "no_enabled_regions" | "already_scheduled" | null;
       }>("/api/run", {
         method: "POST",
         body: JSON.stringify({ mode: "due" })
       });
       if (body.reason === "no_due_jobs") {
+        setRunFeedback("No checks are due in this UTC minute. Scheduled checks run automatically.");
         showToast("info", "No monitor jobs are due in this UTC minute.");
       } else if (body.reason === "no_enabled_regions") {
+        setRunFeedback("No probe regions are enabled. Configure regions before running checks.");
         showToast("danger", "No probe regions are enabled.");
       } else {
-        showToast("info", `Dispatched ${body.dispatchedJobs} probe job${body.dispatchedJobs === 1 ? "" : "s"}; verifying results.`);
+        showToast("info", body.reason === "already_scheduled" ? "This minute is already scheduled; checking its results." : `Dispatched ${body.dispatchedJobs} probe job${body.dispatchedJobs === 1 ? "" : "s"}; verifying results.`);
+        setPendingRunId(body.runId);
         const run = await waitForRun(body.runId);
-        showRunOutcome(run, body.successfulJobs, body.failedJobs);
+        showRunOutcome(run, body.successfulJobs, body.failedJobs, body.unknownJobs);
       }
       await loadSummary(token, false);
     } catch (error) {
+      setRunFeedback(error instanceof Error ? error.message : "Run failed.");
       showToast("danger", error instanceof Error ? error.message : "Run failed.");
     } finally {
       setPendingAction(null);
@@ -450,7 +552,9 @@ function App() {
   }
 
   async function runMonitorSample(monitorId: string) {
+    setPendingRunId(null);
     setPendingAction(`sample:${monitorId}`);
+    setRunFeedback("Contacting regional probes…");
     try {
       const body = await requestJson<{
         runId: string;
@@ -458,16 +562,24 @@ function App() {
         dispatchedJobs: number;
         successfulJobs: number;
         failedJobs: number;
+        unknownJobs: number;
         queued: boolean;
       }>("/api/run", {
           method: "POST",
           body: JSON.stringify({ mode: "sample", monitorId })
         });
       showToast("info", `Dispatched ${body.dispatchedJobs} regional checks; verifying results.`);
+      if (!body.runId) {
+        setRunFeedback("No checks were started. Enable a probe region before sampling.");
+        return;
+      }
+      setPendingRunId(body.runId);
       const run = await waitForRun(body.runId);
-      showRunOutcome(run, body.successfulJobs, body.failedJobs);
-      await Promise.all([loadSummary(token, false), loadMonitorHistory(monitorId)]);
+      showRunOutcome(run, body.successfulJobs, body.failedJobs, body.unknownJobs);
+      await loadSummary(token, false);
+      if (detailTab === "history") await loadMonitorHistory(monitorId);
     } catch (error) {
+      setRunFeedback(error instanceof Error ? error.message : "Sample run failed.");
       showToast("danger", error instanceof Error ? error.message : "Sample run failed.");
     } finally {
       setPendingAction(null);
@@ -480,29 +592,39 @@ function App() {
       await sleep(delay);
       const body = await requestJson<{ run: RunStatus }>(`/api/runs/${encodeURIComponent(runId)}`);
       latest = body.run;
+      setRunFeedback(`${latest.storedResults} / ${latest.plannedJobs} regional results stored.`);
       if (latest.pendingResults === 0) return latest;
     }
     return latest;
   }
 
-  function showRunOutcome(run: RunStatus | null, immediateSuccesses: number, immediateFailures: number) {
+  function showRunOutcome(run: RunStatus | null, immediateSuccesses: number, immediateFailures: number, immediateUnknown = 0) {
+    setPendingRunId(run && run.pendingResults > 0 ? run.id : null);
+    if (run?.error) {
+      const message = run.error === "daily_probe_budget_exhausted" ? "The daily probe budget is exhausted. No new checks were started." : `Run incomplete: ${run.error}`;
+      setRunFeedback(message);
+      showToast("danger", message);
+      return;
+    }
     const successes = run?.successfulResults ?? immediateSuccesses;
     const failures = run?.failedResults ?? immediateFailures;
     const pending = run?.pendingResults ?? 0;
+    const unknown = run?.unknownResults ?? immediateUnknown;
+    setRunFeedback(`${successes} passed · ${failures} target failures · ${unknown} unavailable probes · ${pending} pending.${pending > 0 ? " Results are still arriving. Recheck for the latest status." : ""}`);
     if (pending > 0) {
-      showToast("info", `${successes + failures} results stored; ${pending} still pending.`);
+      showToast("info", `${successes + failures + unknown} results stored; ${pending} still pending.`);
     } else if (failures > 0) {
       showToast("danger", `${successes} checks passed; ${failures} failed.`);
+    } else if (unknown > 0) {
+      showToast("info", `${unknown} probes unavailable; target status is unconfirmed.`);
     } else {
       showToast("success", `${successes} checks passed and were stored.`);
     }
   }
 
   function selectView(next: ViewKey) {
-    setView(next);
-    if (next === "regions" || next === "placement") setDetailTab("regions");
-    if (next === "incidents") setDetailTab("alerts");
-    if (next === "tokens" || next === "monitors") setDetailTab("settings");
+    if (next === view && inspectorMode === "closed") return;
+    navigate(() => { setView(next); setInspectorMode("closed"); });
   }
 
   function openAddMonitor() {
@@ -511,9 +633,9 @@ function App() {
       showToast("danger", "Verify an admin token before creating monitors.");
       return;
     }
-    setView("monitors");
-    setDetailTab("settings");
-    focusInspectorOnCompact();
+    navigate(() => {
+      setView("monitors"); setCreateError(null); setInspectorMode("create"); focusInspectorOnCompact();
+    });
   }
 
   function focusInspectorOnCompact() {
@@ -527,8 +649,26 @@ function App() {
     setToast({ tone, message });
   }
 
+  if (!sessionReady && !summary) {
+    return (
+      <>
+        <AccessGate
+          authStatus={authStatus}
+          error={summaryError}
+          loading={pendingAction === "token" || authStatus === "verifying"}
+          onTokenSave={saveToken}
+        />
+        {toast ? <Toast tone={toast.tone} message={toast.message} /> : null}
+      </>
+    );
+  }
+
+  const showInspector = (view === "overview" || view === "monitors") && inspectorMode !== "closed";
+
   return (
-    <div className="app-shell">
+    <DirtyContext.Provider value={reportDirty}>
+    <NavigateContext.Provider value={navigate}>
+    <ProSidebar.Provider collapsible="icon" toggleShortcut={false} className={`app-shell${showInspector ? " has-inspector" : ""}`}>
       <Sidebar
         view={view}
         summary={data}
@@ -558,6 +698,15 @@ function App() {
           onAdd={openAddMonitor}
         />
         <section className="workspace-body">
+          {runFeedback ? <div className="run-feedback" role="status"><Activity size={16} /><span>{runFeedback}</span>
+            {pendingRunId ? <Button size="sm" variant="outline" isDisabled={actionLoading} onPress={async () => {
+              setPendingAction("recheck-run");
+              try { showRunOutcome(await waitForRun(pendingRunId), 0, 0); await loadSummary(); }
+              catch (error) { showToast("danger", error instanceof Error ? error.message : "Unable to recheck run."); }
+              finally { setPendingAction(null); }
+            }}>Recheck</Button> : null}
+            <Button size="sm" variant="ghost" isDisabled={actionLoading} onPress={() => { setRunFeedback(null); setPendingRunId(null); }}>Dismiss</Button>
+          </div> : null}
           <DataStateBanner
             authStatus={authStatus}
             generatedAt={summary?.generatedAt ?? null}
@@ -565,44 +714,130 @@ function App() {
             summaryError={summaryError}
           />
           <MainView
+            key={`view:${draftGeneration}`}
             view={view}
             summary={data}
             health={health}
             latestByMonitor={latestByMonitor}
             monitors={filteredMonitors}
-            selectedMonitorId={selectedMonitorId}
+            selectedMonitorId={inspectorMode === "detail" ? selectedMonitorId : null}
             token={sessionReady ? token : ""}
             loading={actionLoading || !sessionReady}
             onTokenSave={saveToken}
             onRegionSave={saveRegionConfig}
-            onMonitorSelect={(monitor) => {
+            onMonitorSelect={(monitor) => navigate(() => {
+              setView("monitors");
               setSelectedMonitorId(monitor.id);
               setDetailTab("overview");
-            }}
+              setInspectorMode("detail");
+              focusInspectorOnCompact();
+            })}
           />
         </section>
       </main>
-      <Inspector
-        summary={data}
-        monitor={selectedMonitor}
-        latest={selectedLatest}
-        history={history}
-        historyError={historyError}
-        historyLoading={historyLoading}
-        tab={detailTab}
-        form={form}
-        token={sessionReady ? token : ""}
-        loading={actionLoading || !sessionReady}
-        onTabChange={setDetailTab}
-        onTokenSave={saveToken}
-        onMonitorSave={saveMonitorConfig}
-        onMonitorRun={runMonitorSample}
-        onHistoryRetry={() => selectedMonitorId && loadMonitorHistory(selectedMonitorId)}
-        onFormChange={setForm}
-        onCreate={createMonitor}
-      />
+      {showInspector ? (
+        <Inspector
+          key={`inspector:${draftGeneration}`}
+          summary={data}
+          monitor={selectedMonitor}
+          latest={selectedLatest}
+          history={history}
+          historyError={historyError}
+          historyLoading={historyLoading}
+          mode={inspectorMode}
+          tab={detailTab}
+          form={form}
+          createError={createError}
+          loading={actionLoading}
+          onClose={() => navigate(() => setInspectorMode("closed"))}
+          onTabChange={(tab) => { if (tab !== detailTab) navigate(() => setDetailTab(tab)); }}
+          onMonitorSave={saveMonitorConfig}
+          onMonitorRun={runMonitorSample}
+          onHistoryRetry={() => selectedMonitorId && loadMonitorHistory(selectedMonitorId)}
+          onFormChange={(nextForm) => {
+            setForm(nextForm);
+            if (createError) setCreateError(null);
+          }}
+          onCreate={createMonitor}
+        />
+      ) : null}
       {toast ? <Toast tone={toast.tone} message={toast.message} /> : null}
-    </div>
+      <Modal.Backdrop isOpen={!sessionReady && Boolean(summary)} isDismissable={false}>
+        <Modal.Container size="sm"><Modal.Dialog>
+          <Modal.Header><Modal.Heading>Verify admin access</Modal.Heading></Modal.Header>
+          <Modal.Body>
+            <p>Your unsaved configuration is preserved. Verify your token to continue.</p>
+            <TokenForm loading={authStatus === "verifying"} submitLabel="Verify and continue" tokenSet={false} onTokenSave={saveToken} />
+            {summaryError ? <p role="alert">{summaryError}</p> : null}
+          </Modal.Body>
+        </Modal.Dialog></Modal.Container>
+      </Modal.Backdrop>
+      <Modal.Backdrop isOpen={Boolean(leaveAction)} onOpenChange={(open) => { if (!open) setLeaveAction(null); }}>
+        <Modal.Container size="sm"><Modal.Dialog>
+          <Modal.Header><Modal.Heading>Discard unsaved changes?</Modal.Heading></Modal.Header>
+          <Modal.Body>Your saved configuration will stay unchanged.</Modal.Body>
+          <Modal.Footer>
+            <Button variant="secondary" onPress={() => setLeaveAction(null)}>Keep editing</Button>
+            <Button variant="danger-soft" onPress={() => {
+              dirtyDrafts.current.clear(); setDraftGeneration((value) => value + 1); setForm(defaultMonitorDraft); leaveAction?.execute(); setLeaveAction(null);
+            }}>Discard changes</Button>
+          </Modal.Footer>
+        </Modal.Dialog></Modal.Container>
+      </Modal.Backdrop>
+    </ProSidebar.Provider>
+    </NavigateContext.Provider>
+    </DirtyContext.Provider>
+  );
+}
+
+function AccessGate({
+  authStatus,
+  error,
+  loading,
+  onTokenSave
+}: {
+  authStatus: AuthStatus;
+  error: string | null;
+  loading: boolean;
+  onTokenSave: (value: string) => void | Promise<void>;
+}) {
+  return (
+    <main className="access-shell">
+      <section className="access-panel" aria-labelledby="access-title">
+        <div className="access-brand">
+          <div className="brand-mark">
+            <Signal size={18} />
+          </div>
+          <div>
+            <strong>MonsterTracker</strong>
+            <span>Cloudflare edge monitor</span>
+          </div>
+        </div>
+        <div className="access-heading">
+          <div className="access-icon"><KeyRound size={20} /></div>
+          <div>
+            <h1 id="access-title">Admin access</h1>
+            <p>Enter the <code>ADMIN_TOKEN</code> configured for the control Worker.</p>
+          </div>
+        </div>
+        <TokenForm
+          loading={loading}
+          submitLabel={authStatus === "verifying" ? "Verifying access" : "Open console"}
+          tokenSet={false}
+          onTokenSave={onTokenSave}
+        />
+        {error ? (
+          <div className="access-error" role="alert">
+            <AlertTriangle size={16} />
+            <span>{error}</span>
+          </div>
+        ) : null}
+        <div className="access-footnote">
+          <LockKeyhole size={14} />
+          <span>Stored only in this browser session and sent as Bearer authorization.</span>
+        </div>
+      </section>
+    </main>
   );
 }
 
@@ -624,8 +859,8 @@ function Sidebar({
   const tokenSet = authStatus === "authenticated";
   const sessionLabel =
     authStatus === "authenticated" ? "Admin session" : authStatus === "verifying" ? "Verifying access" : "Locked session";
-  return (
-    <aside className="sidebar">
+  const contents = <>
+    <ProSidebar.Header>
       <div className="brand-row">
         <div className="brand-mark">
           <Signal size={18} />
@@ -636,6 +871,14 @@ function Sidebar({
         </div>
       </div>
 
+    </ProSidebar.Header>
+    <ProSidebar.Content>
+      <nav className="nav-stack" aria-label="Primary navigation">
+        <NavGroup items={primaryNavItems} label="Monitor" openIncidentCount={openIncidentCount} summary={summary} view={view} onChange={onChange} />
+        <NavGroup items={systemNavItems} label="System" openIncidentCount={openIncidentCount} summary={summary} view={view} onChange={onChange} />
+      </nav>
+    </ProSidebar.Content>
+    <ProSidebar.Footer>
       <Surface className="operator-card">
         <div>
           <span>Cloudflare account</span>
@@ -646,34 +889,6 @@ function Sidebar({
         </Chip>
       </Surface>
 
-      <nav className="nav-stack">
-        {navItems.map((item) => {
-          const Icon = item.icon;
-          const count = item.key === "overview" || item.key === "monitors"
-            ? summary.monitors.length
-            : item.key === "regions" || item.key === "placement"
-              ? summary.regions.filter((region) => region.enabled).length
-              : item.key === "incidents"
-                ? openIncidentCount
-                : undefined;
-          return (
-            <button
-              aria-label={item.label}
-              className={view === item.key ? "nav-button active" : "nav-button"}
-              key={item.key}
-              onClick={() => onChange(item.key)}
-              type="button"
-            >
-              <span>
-                <Icon size={17} />
-                <span className="nav-label">{item.label}</span>
-              </span>
-              {typeof count === "number" ? <em>{count}</em> : null}
-            </button>
-          );
-        })}
-      </nav>
-
       <div className="sidebar-footer">
         <div className="quota-ring">
           <span>{Math.min(100, health.budgetPct)}%</span>
@@ -683,7 +898,55 @@ function Sidebar({
           <span>{formatNumber(summary.usage.reservedProbes)} reserved · {formatNumber(summary.usage.probeResults)} recorded</span>
         </div>
       </div>
-    </aside>
+    </ProSidebar.Footer>
+  </>;
+  return <><ProSidebar className="app-nav">{contents}</ProSidebar><ProSidebar.Mobile>{contents}</ProSidebar.Mobile></>;
+}
+
+function NavGroup({
+  items,
+  label,
+  openIncidentCount,
+  summary,
+  view,
+  onChange
+}: {
+  items: Array<{ key: ViewKey; label: string; icon: typeof Activity }>;
+  label: string;
+  openIncidentCount: number;
+  summary: Summary;
+  view: ViewKey;
+  onChange: (view: ViewKey) => void;
+}) {
+  return (
+    <ProSidebar.Group>
+      <ProSidebar.GroupLabel>{label}</ProSidebar.GroupLabel>
+      <ProSidebar.Menu aria-label={label}>
+      {items.map((item) => {
+          const Icon = item.icon;
+          const count = item.key === "overview" || item.key === "monitors"
+            ? summary.monitors.length
+            : item.key === "regions"
+              ? summary.regions.filter((region) => region.enabled).length
+              : item.key === "incidents"
+                ? openIncidentCount
+                : undefined;
+          return (
+            <ProSidebar.MenuItem
+              id={item.key}
+              textValue={item.label}
+              isCurrent={view === item.key}
+              key={item.key}
+              onAction={() => onChange(item.key)}
+            >
+              <ProSidebar.MenuIcon><Icon size={18} /></ProSidebar.MenuIcon>
+              <ProSidebar.MenuLabel>{item.label}</ProSidebar.MenuLabel>
+              {typeof count === "number" ? <ProSidebar.MenuChip>{count}</ProSidebar.MenuChip> : null}
+            </ProSidebar.MenuItem>
+          );
+        })}
+      </ProSidebar.Menu>
+    </ProSidebar.Group>
   );
 }
 
@@ -755,22 +1018,24 @@ function TopBar({
   onRun: () => void;
 }) {
   const titles: Record<ViewKey, [string, string]> = {
-    overview: ["Global Monitors", `${summary.monitors.length} monitors across ${summary.regions.length} placed regions`],
-    monitors: ["Monitor Config", `${summary.monitors.length} configured targets`],
-    regions: ["Probe Regions", `${summary.regions.filter((region) => region.enabled).length} active placement hints`],
+    overview: ["Overview", `${summary.monitors.length} monitors across ${summary.regions.filter((region) => region.enabled).length} enabled regions`],
+    monitors: ["Monitors", `${summary.monitors.length} configured targets`],
+    regions: ["Regions", `${summary.regions.filter((region) => region.enabled).length} enabled probe locations`],
     incidents: [
       "Incidents",
-      `${summary.incidents.filter((incident) => incident.status === "open").length} open · ${summary.incidents.length} recent`
+      `${summary.incidents.filter((incident) => incident.status !== "resolved").length} open · ${summary.incidents.length} recent`
     ],
     usage: ["Usage", `${formatNumber(summary.usage.probeResults)} probe results today`],
-    placement: ["Placement", `${summary.regions.length} Worker routes and placement hints`],
-    tokens: ["Access", tokenSet ? "Admin token is active in this browser session" : "Admin token required"]
+    placement: ["Regions", `${summary.regions.length} Worker routes and placement hints`],
+    tokens: ["Settings", tokenSet ? "Admin session and runtime configuration" : "Admin token required"]
   };
   const [title, subtitle] = titles[view];
+  const showRunAction = view === "overview" || view === "monitors";
 
   return (
     <header className="topbar">
       <div className="title-block">
+        <ProSidebar.Trigger className="mobile-nav-trigger" aria-label="Open navigation" />
         <div className="title-icon">
           <Zap size={20} />
         </div>
@@ -782,17 +1047,19 @@ function TopBar({
       <div className="top-actions">
         <Surface className="budget-meter">
           <span>Probe budget</span>
-          <ProgressBar aria-label="Probe budget used" value={health.budgetPct} />
+          <ProgressBar aria-label="Probe budget used" value={health.budgetPct}><ProgressBar.Track><ProgressBar.Fill /></ProgressBar.Track></ProgressBar>
           <strong>{health.budgetPct}%</strong>
         </Surface>
         <Button isDisabled={refreshing} onPress={onRefresh} size="sm" variant="outline">
           <RefreshCw size={16} />
           {refreshing ? "Refreshing" : "Refresh"}
         </Button>
-        <Button className="primary-action" isDisabled={actionLoading || !tokenSet} onPress={onRun} size="sm" variant="primary">
-          <Play size={16} />
-          Run Due Now
-        </Button>
+        {showRunAction ? (
+          <Button className="primary-action" isDisabled={actionLoading || !tokenSet} onPress={onRun} size="sm" variant="primary">
+            <Play size={16} />
+            Run due checks
+          </Button>
+        ) : null}
       </div>
     </header>
   );
@@ -817,7 +1084,7 @@ function CommandBar({
 }) {
   const showFilters = view === "overview" || view === "monitors";
   return (
-    <div className="commandbar">
+    <div className={`commandbar${showFilters ? "" : " mobile-only-commandbar"}`}>
       <label className="mobile-view-select">
         <Command size={16} />
         <select
@@ -851,23 +1118,20 @@ function CommandBar({
               <option value="all">All status</option>
               <option value="up">Up</option>
               <option value="down">Down</option>
-              <option value="partial">Partial</option>
+              <option value="partial">Degraded</option>
+              <option value="unknown">Unknown</option>
+              <option value="incomplete">Gathering coverage</option>
               <option value="stale">Stale</option>
               <option value="paused">Paused</option>
-              <option value="idle">Idle</option>
+              <option value="idle">Not checked</option>
             </select>
           </label>
+          <Button onPress={onAdd} size="sm" variant="secondary">
+            <Plus size={16} />
+            Add monitor
+          </Button>
         </>
-      ) : (
-        <div className="command-context">
-          <Command size={16} />
-          <span>{viewLabel(view)}</span>
-        </div>
-      )}
-      <Button onPress={onAdd} size="sm" variant="secondary">
-        <Plus size={16} />
-        Add Monitor
-      </Button>
+      ) : null}
     </div>
   );
 }
@@ -897,20 +1161,9 @@ function MainView({
   onRegionSave: (id: string, patch: RegionConfigPatch) => void | Promise<void>;
   onMonitorSelect: (monitor: MonitorConfig) => void;
 }) {
-  if (view === "regions") return <RegionsView regions={summary.regions} />;
-  if (view === "incidents") {
+  if (view === "regions" || view === "placement") {
     return (
-      <IncidentsView
-        incidents={summary.incidents}
-        monitors={summary.monitors}
-        retentionDays={summary.runtime.retentionDays}
-      />
-    );
-  }
-  if (view === "usage") return <UsageView summary={summary} health={health} />;
-  if (view === "placement") {
-    return (
-      <PlacementView
+      <RegionsView
         allowedHostnameSuffix={summary.runtime.probeWorkerHostSuffix}
         loading={loading}
         regions={summary.regions}
@@ -918,15 +1171,30 @@ function MainView({
       />
     );
   }
-  if (view === "tokens") return <TokensView tokenSet={Boolean(token.trim())} onTokenSave={onTokenSave} />;
+  if (view === "incidents") {
+    return (
+      <IncidentsView
+        incidents={summary.incidents}
+        monitors={summary.monitors}
+        retentionDays={summary.runtime.retentionDays}
+        onMonitorSelect={onMonitorSelect}
+      />
+    );
+  }
+  if (view === "usage") return <UsageView summary={summary} health={health} />;
+  if (view === "tokens") {
+    return <SettingsView summary={summary} tokenSet={Boolean(token.trim())} onTokenSave={onTokenSave} />;
+  }
   return (
     <>
-      <MetricStrip summary={summary} health={health} />
+      {view === "overview" ? <MetricStrip summary={summary} health={health} /> : null}
       <MonitorTable
+        description={view === "overview" ? "Fresh status and coverage from enabled regions." : "Select a target to inspect, test, or edit its configuration."}
         latestByMonitor={latestByMonitor}
         monitors={monitors}
         regions={summary.regions}
         selectedMonitorId={selectedMonitorId}
+        title={view === "overview" ? "Monitor status" : "All monitors"}
         onMonitorSelect={onMonitorSelect}
       />
     </>
@@ -934,14 +1202,20 @@ function MainView({
 }
 
 function MetricStrip({ summary, health }: { summary: Summary; health: HealthSummary }) {
+  const attention = health.down + health.partial + health.stale + health.unknown;
+  const unchecked = health.idle + health.incomplete;
   return (
     <div className="metric-strip">
-      <MetricCard icon={Server} label="Monitors" tone="teal" value={summary.monitors.length} />
-      <MetricCard icon={Globe2} label="Regions" tone="indigo" value={summary.regions.filter((region) => region.enabled).length} />
-      <MetricCard icon={CheckCircle2} label="Up" tone="green" value={health.up} />
-      <MetricCard icon={AlertTriangle} label="Down" tone="amber" value={health.down} />
-      <MetricCard icon={Clock3} label="Stale" tone="rose" value={health.stale} />
-      <MetricCard icon={Clock3} label="Daily probes" tone="purple" value={formatNumber(summary.usage.probeResults)} />
+      <MetricCard icon={CheckCircle2} label="Healthy" note={`${summary.monitors.length} total monitors`} tone="green" value={health.up} />
+      <MetricCard icon={AlertTriangle} label="Needs attention" note="failed, unknown, or stale" tone="rose" value={attention} />
+      <MetricCard icon={Clock3} label="Gathering evidence" note={`${health.paused} paused · awaiting full coverage`} tone="amber" value={unchecked} />
+      <MetricCard
+        icon={ShieldCheck}
+        label="Open incidents"
+        note={`${summary.incidents.length} retained incidents`}
+        tone="indigo"
+        value={summary.incidents.filter((incident) => incident.status !== "resolved").length}
+      />
     </div>
   );
 }
@@ -949,11 +1223,13 @@ function MetricStrip({ summary, health }: { summary: Summary; health: HealthSumm
 function MetricCard({
   icon: Icon,
   label,
+  note,
   value,
   tone
 }: {
   icon: typeof Activity;
   label: string;
+  note: string;
   value: string | number;
   tone: string;
 }) {
@@ -965,18 +1241,23 @@ function MetricCard({
         </div>
         <span>{label}</span>
         <strong>{value}</strong>
+        <small>{note}</small>
       </Card.Content>
     </Card>
   );
 }
 
 function MonitorTable({
+  title,
+  description,
   monitors,
   latestByMonitor,
   regions,
   selectedMonitorId,
   onMonitorSelect
 }: {
+  title: string;
+  description: string;
   monitors: MonitorConfig[];
   latestByMonitor: Map<string, LatestResult[]>;
   regions: RegionConfig[];
@@ -988,8 +1269,8 @@ function MonitorTable({
   const regionCount = enabledRegions.length;
   const rows = monitors.map((monitor) => {
     const latest = (latestByMonitor.get(monitor.id) || []).filter((item) => enabledRegionIds.has(item.regionId));
-    const freshLatest = latest.filter((item) => !isRegionResultStale(item, monitor, regionCount));
-    const status = monitorStatus(latest, monitor, regionCount);
+    const freshLatest = latest.filter((item) => item.resultType !== "infrastructure" && !isRegionResultStale(item, monitor, regions));
+    const status = monitorStatus(latest, monitor, regions);
     const latency = median(freshLatest.map((item) => item.latencyMs).filter(isFiniteNumber));
     const checked = freshLatest.length;
     const selected = monitor.id === selectedMonitorId;
@@ -1000,8 +1281,8 @@ function MonitorTable({
     <Card className="data-card" variant="default">
       <Card.Header>
         <div>
-          <Card.Title>Monitor worklist</Card.Title>
-          <Card.Description>Operational status, latency and regional coverage.</Card.Description>
+          <Card.Title>{title}</Card.Title>
+          <Card.Description>{description}</Card.Description>
         </div>
         <Chip size="sm" variant="soft">{monitors.length} targets</Chip>
       </Card.Header>
@@ -1054,11 +1335,11 @@ function MonitorTable({
             })}
           </tbody>
         </table> : (
-          <div className="inline-empty-state">
-            <Search size={22} />
-            <strong>No monitors match this view</strong>
-            <span>Adjust the search or status filter, or add a monitor.</span>
-          </div>
+          <EmptyState size="sm"><EmptyState.Header>
+            <EmptyState.Media variant="icon"><Search size={22} /></EmptyState.Media>
+            <EmptyState.Title>No monitors match this view</EmptyState.Title>
+            <EmptyState.Description>Adjust the search or status filter, or add a monitor.</EmptyState.Description>
+          </EmptyState.Header></EmptyState>
         )}
         <div className="mobile-monitor-list">
           {rows.map(({ checked, latency, latest, monitor, selected, status }) => (
@@ -1087,63 +1368,105 @@ function MonitorTable({
   );
 }
 
-function RegionsView({ regions }: { regions: RegionConfig[] }) {
+function RegionsView({
+  allowedHostnameSuffix,
+  regions,
+  loading,
+  onRegionSave
+}: {
+  allowedHostnameSuffix: string;
+  regions: RegionConfig[];
+  loading: boolean;
+  onRegionSave: (id: string, patch: RegionConfigPatch) => void | Promise<void>;
+}) {
+  const [section, setSection] = useState<"status" | "routing">("status");
+  const navigate = useContext(NavigateContext);
+
   return (
-    <Card className="data-card" variant="default">
-      <Card.Header>
+    <>
+      <div className="page-section-bar">
         <div>
-          <Card.Title>Regional probe mesh</Card.Title>
-          <Card.Description>Placement hints and last seen metadata from Workers.</Card.Description>
+          <strong>Probe network</strong>
+          <span>Status is observational; routing changes scheduler dispatch.</span>
         </div>
-      </Card.Header>
-      <Card.Content className="region-board">
-        {regions.map((region) => {
-          const state = regionOperationalState(region);
-          return (
-            <Surface className="region-row" key={region.id}>
-              <div className="region-lead">
-                <span className={`status-dot ${state}`} />
-                <div>
-                  <strong>{region.label}</strong>
-                  <span>{region.area}</span>
-                </div>
-              </div>
+        <div className="incident-filters" role="group" aria-label="Region view">
+          <button aria-pressed={section === "status"} onClick={() => { if (section !== "status") navigate(() => setSection("status")); }} type="button">Status</button>
+          <button aria-pressed={section === "routing"} onClick={() => setSection("routing")} type="button">Routing</button>
+        </div>
+      </div>
+      {section === "status" ? (
+        <Card className="data-card" variant="default">
+          <Card.Header>
+            <div>
+              <Card.Title>Regional probe status</Card.Title>
+              <Card.Description>Latest Worker presence and placement metadata.</Card.Description>
+            </div>
+            <Chip size="sm" variant="soft">{regions.filter((region) => region.enabled).length} enabled</Chip>
+          </Card.Header>
+          <Card.Content className="region-board">
+            <div className="region-column-head" aria-hidden="true">
+              <span>Location</span>
+              <span>State</span>
+              <span>Provider region</span>
+              <span>Placement hint</span>
+              <span>Last seen</span>
+            </div>
+            {regions.map((region) => {
+              const state = regionOperationalState(region);
+              return (
+                <Surface className="region-row" key={region.id}>
+                  <div className="region-lead">
+                    <span className={`status-dot ${state}`} />
+                    <div>
+                      <strong>{region.label}</strong>
+                      <span>{region.area}</span>
+                    </div>
+                  </div>
               <Chip color={state === "active" ? "success" : state === "paused" ? "warning" : "danger"} size="sm" variant="soft">
-                {state}
-              </Chip>
-              <span>{region.provider}:{region.providerRegion}</span>
-              <span>{region.placementRegion}</span>
-              <span>{region.lastSeenAt ? relativeTime(region.lastSeenAt) : "never"}</span>
-            </Surface>
-          );
-        })}
-      </Card.Content>
-    </Card>
+                    {state}
+                  </Chip>
+                  <span>{region.provider}:{region.providerRegion}</span>
+                  <span>{region.placementRegion}</span>
+                  <span>{region.lastSeenAt ? relativeTime(region.lastSeenAt) : "never"}</span>
+                </Surface>
+              );
+            })}
+          </Card.Content>
+        </Card>
+      ) : (
+        <PlacementView
+          allowedHostnameSuffix={allowedHostnameSuffix}
+          loading={loading}
+          regions={regions}
+          onRegionSave={onRegionSave}
+        />
+      )}
+    </>
   );
 }
 
 function IncidentsView({
   incidents,
   monitors,
-  retentionDays
+  retentionDays,
+  onMonitorSelect
 }: {
   incidents: Incident[];
   monitors: MonitorConfig[];
   retentionDays: number;
+  onMonitorSelect: (monitor: MonitorConfig) => void;
 }) {
   const [scope, setScope] = useState<"open" | "resolved">("open");
-  const visibleIncidents = incidents.filter((incident) => incident.status === scope);
-  const monitorNames = new Map(monitors.map((monitor) => [monitor.id, monitor.name]));
+  const visibleIncidents = incidents.filter((incident) => scope === "open" ? incident.status !== "resolved" : incident.status === "resolved");
+  const monitorById = new Map(monitors.map((monitor) => [monitor.id, monitor]));
 
   if (!incidents.length) {
     return (
-      <Card className="empty-state" variant="default">
-        <Card.Content>
-          <ShieldCheck size={30} />
-          <strong>No incident history</strong>
-          <span>Incident records will appear after a monitor reports a regional failure.</span>
-        </Card.Content>
-      </Card>
+      <EmptyState><EmptyState.Header>
+        <EmptyState.Media variant="icon"><ShieldCheck size={26} /></EmptyState.Media>
+        <EmptyState.Title>No incident history</EmptyState.Title>
+        <EmptyState.Description>Incident records will appear after a monitor reports a regional failure.</EmptyState.Description>
+      </EmptyState.Header></EmptyState>
     );
   }
   return (
@@ -1151,33 +1474,42 @@ function IncidentsView({
       <Card.Header>
         <div>
           <Card.Title>Incident timeline</Card.Title>
-          <Card.Description>Open failures and resolved history retained for {retentionDays} days.</Card.Description>
+          <Card.Description>Open or unconfirmed incidents and resolved history retained for {retentionDays} days.</Card.Description>
         </div>
-        <div className="incident-filters" role="group" aria-label="Incident status">
-          <button aria-pressed={scope === "open"} onClick={() => setScope("open")} type="button">
-            Open {incidents.filter((incident) => incident.status === "open").length}
-          </button>
-          <button aria-pressed={scope === "resolved"} onClick={() => setScope("resolved")} type="button">
+        <Segment selectedKey={scope} onSelectionChange={(key) => setScope(key as "open" | "resolved")} aria-label="Incident status">
+          <Segment.Item id="open">
+            Open {incidents.filter((incident) => incident.status !== "resolved").length}
+          </Segment.Item>
+          <Segment.Item id="resolved">
             Resolved
-          </button>
-        </div>
+          </Segment.Item>
+        </Segment>
       </Card.Header>
       <Card.Content className="stack-list">
-        {visibleIncidents.length ? visibleIncidents.map((incident) => (
-          <Surface className="incident-card" key={incident.id}>
-            <div>
-              <strong>{monitorNames.get(incident.monitorId) || incident.monitorId}</strong>
-              <span>{incident.summary} · opened {relativeTime(incident.openedAt)}</span>
-              {incident.closedAt ? <span>Resolved {relativeTime(incident.closedAt)}</span> : null}
-            </div>
-            <div className="incident-meta">
-              <Chip color={incident.status === "open" ? "danger" : "success"} size="sm" variant="soft">
-                {incident.status}
-              </Chip>
-              <span>{incident.severity}</span>
-            </div>
-          </Surface>
-        )) : (
+        {visibleIncidents.length ? visibleIncidents.map((incident) => {
+          const monitor = monitorById.get(incident.monitorId);
+          return (
+            <Surface className="incident-card" key={incident.id}>
+              <div>
+                <strong>{monitor?.name || incident.monitorId}</strong>
+                <span>{incident.summary} · opened {relativeTime(incident.openedAt)}</span>
+                {incident.closedAt ? <span>Resolved {relativeTime(incident.closedAt)}</span> : null}
+              </div>
+              <div className="incident-actions">
+                <div className="incident-meta">
+                  <Chip color={incident.status === "unknown" ? "warning" : incident.status === "open" ? "danger" : "success"} size="sm" variant="soft">
+                    {incident.status}
+                  </Chip>
+                  <span>{incident.severity}</span>
+                </div>
+                <Button isDisabled={!monitor} onPress={() => monitor && onMonitorSelect(monitor)} size="sm" variant="secondary">
+                  <Server size={14} />
+                  Inspect
+                </Button>
+              </div>
+            </Surface>
+          );
+        }) : (
           <div className="inline-empty-state compact">
             <ShieldCheck size={22} />
             <strong>No {scope} incidents</strong>
@@ -1189,12 +1521,16 @@ function IncidentsView({
 }
 
 function UsageView({ summary, health }: { summary: Summary; health: HealthSummary }) {
+  const estimate = estimateCost({ urlCount: summary.monitors.length, probesPerDay: 0,
+    monitorBudgets: summary.monitors.filter((monitor) => monitor.enabled).map((monitor) => monitor.effectiveDailyBudget ?? monitor.dailyBudget),
+    queueBatchSize: summary.runtime.resultQueueBatchSize });
+  const queueOps = summary.usage.queueMessages * 3;
   const rows: Array<[string, string | number, number, string]> = [
     [
       "Reserved probe budget",
       formatNumber(summary.usage.reservedProbes),
       Math.min(100, Math.round((summary.usage.reservedProbes / summary.runtime.maxDailyProbes) * 100)),
-      `hard cap ${formatNumber(summary.runtime.maxDailyProbes)}`
+      `new-check allocation limit ${formatNumber(summary.runtime.maxDailyProbes)}; recovery attempts are extra`
     ],
     [
       "Probe results",
@@ -1204,8 +1540,7 @@ function UsageView({ summary, health }: { summary: Summary; health: HealthSummar
     ],
     ["Tracked Worker invocations", formatNumber(summary.usage.workerInvocations), Math.min(100, Math.round((summary.usage.workerInvocations / 100_000) * 100)), "internal estimate"],
     ["Analytics points", formatNumber(summary.usage.probeResults), Math.min(100, Math.round((summary.usage.probeResults / 100_000) * 100)), "Free reference 100k/day"],
-    ["D1 writes", formatNumber(summary.usage.d1Writes), Math.min(100, Math.round((summary.usage.d1Writes / 100_000) * 100)), "Free reference 100k/day"],
-    ["Queue messages", formatNumber(summary.usage.queueMessages), Math.min(100, Math.round((summary.usage.queueMessages / 10_000) * 100)), "Free reference 10k ops/day"]
+    ["Queue operations (baseline)", formatNumber(queueOps), Math.min(100, Math.round((queueOps / 10_000) * 100)), `${formatNumber(summary.usage.queueMessages)} messages × 3; excludes retries and size overhead`]
   ];
   return (
     <>
@@ -1214,17 +1549,22 @@ function UsageView({ summary, health }: { summary: Summary; health: HealthSummar
         <Card.Header>
           <div>
             <Card.Title>Daily usage guardrails</Card.Title>
-            <Card.Description>Configured scheduler capacity and current Cloudflare Free reference limits.</Card.Description>
+            <Card.Description>Today in UTC. Application counters are estimates, not your Cloudflare bill.</Card.Description>
           </div>
         </Card.Header>
         <Card.Content className="quota-list">
+          <div className="strategy-note">
+            <strong>{formatNumber(estimate.queueOperationsPerDay)} Queue operations / scheduled day</strong>
+            <span>Based on each monitor’s effective budget and {summary.runtime.resultQueueBatchSize}-result messages. Manual runs and retries use additional capacity.</span>
+            <span>D1: {formatNumber(summary.usage.d1Writes)} logical row writes tracked. Indexes, acknowledgements and scheduling add writes; check Cloudflare for metered usage.</span>
+          </div>
           {rows.map(([label, value, pct, note]) => (
             <div className="quota-row" key={label}>
               <div>
                 <strong>{label}</strong>
                 <span>{value} · {note}</span>
               </div>
-              <ProgressBar aria-label={label} value={pct} />
+              <ProgressBar aria-label={label} value={pct}><ProgressBar.Track><ProgressBar.Fill /></ProgressBar.Track></ProgressBar>
               <em>{pct}%</em>
             </div>
           ))}
@@ -1252,8 +1592,8 @@ function UsageView({ summary, health }: { summary: Summary; health: HealthSummar
                 <strong>{run.trigger === "manual" ? "Manual" : "Cron"} run</strong>
                 <span>{relativeTime(run.startedAt)} · {run.id}</span>
               </div>
-              <Chip color={run.error ? "danger" : "success"} size="sm" variant="soft">
-                {run.error ? "failed" : "ok"}
+              <Chip color={run.error || run.dispatchedJobs < run.plannedJobs ? "warning" : !run.finishedAt ? "default" : "success"} size="sm" variant="soft">
+                {run.error ? (run.finishedAt ? "failed" : "retrying") : !run.finishedAt ? "running" : run.dispatchedJobs < run.plannedJobs ? "incomplete dispatch" : run.plannedJobs === 0 ? "no work" : "dispatched"}
               </Chip>
               <span>{run.dispatchedJobs} / {run.plannedJobs} jobs</span>
               <span>{run.error ? compactText(run.error, 48) : run.finishedAt ? `finished ${relativeTime(run.finishedAt)}` : `${run.skippedJobs} skipped`}</span>
@@ -1367,17 +1707,16 @@ function RegionRouteEditor({
       }
     }
     setValidationError(null);
-    await onSave(region.id, {
-      workerUrl: workerUrl.trim() || null,
-      weight: parsedWeight,
-      enabled
-    });
+    try {
+      await onSave(region.id, { workerUrl: workerUrl.trim() || null, weight: parsedWeight, enabled });
+    } catch (error) { setValidationError(error instanceof Error ? error.message : "Save failed. Please retry."); }
   }
 
   const dirty =
     workerUrl.trim() !== (region.workerUrl || "") ||
     weight !== String(region.weight) ||
     enabled !== region.enabled;
+  useDirtyDraft(`region:${region.id}`, dirty);
 
   return (
     <Surface className="route-row editable">
@@ -1426,9 +1765,13 @@ function RegionRouteEditor({
 }
 
 function TokenForm({
+  loading = false,
+  submitLabel,
   tokenSet,
   onTokenSave
 }: {
+  loading?: boolean;
+  submitLabel?: string;
   tokenSet: boolean;
   onTokenSave: (value: string) => void | Promise<void>;
 }) {
@@ -1457,8 +1800,9 @@ function TokenForm({
           aria-label="Admin token"
           autoComplete="current-password"
           fullWidth
+          disabled={loading}
           onChange={(event) => setDraft(event.currentTarget.value)}
-          placeholder={tokenSet ? "Token set for this session" : "ADMIN_TOKEN"}
+          placeholder={tokenSet ? "Enter a new token" : "ADMIN_TOKEN"}
           type={revealed ? "text" : "password"}
           value={draft}
           variant="secondary"
@@ -1466,7 +1810,7 @@ function TokenForm({
         <Button
           aria-label={revealed ? "Hide token" : "Show token"}
           className="icon-button"
-          isDisabled={!draft}
+          isDisabled={loading || !draft}
           onPress={() => setRevealed((current) => !current)}
           size="sm"
           type="button"
@@ -1476,51 +1820,75 @@ function TokenForm({
         </Button>
       </div>
       <div className="token-actions">
-        <Button className="primary-action" isDisabled={!draft.trim()} size="sm" type="submit" variant="primary">
-          Save token
+        <Button className="primary-action" isDisabled={loading || !draft.trim()} size="sm" type="submit" variant="primary">
+          {submitLabel || (tokenSet ? "Update token" : "Save token")}
         </Button>
-        <Button
-          isDisabled={!tokenSet && !draft}
-          onPress={clearToken}
-          size="sm"
-          type="button"
-          variant="secondary"
-        >
-          <Trash2 size={15} />
-          Clear
-        </Button>
+        {tokenSet ? (
+          <Button isDisabled={loading} onPress={clearToken} size="sm" type="button" variant="secondary">
+            <LogOut size={15} />
+            Sign out
+          </Button>
+        ) : null}
       </div>
     </form>
   );
 }
 
-function TokensView({
+function SettingsView({
+  summary,
   tokenSet,
   onTokenSave
 }: {
+  summary: Summary;
   tokenSet: boolean;
   onTokenSave: (value: string) => void | Promise<void>;
 }) {
   return (
-    <Card className="token-panel" variant="default">
-      <Card.Header>
-        <div>
-          <Card.Title>Admin access</Card.Title>
-          <Card.Description>Token is stored only in this browser session.</Card.Description>
-        </div>
-        <LockKeyhole size={20} />
-      </Card.Header>
-      <Card.Content>
-        <TokenForm tokenSet={tokenSet} onTokenSave={onTokenSave} />
-        <div className="token-states">
+    <div className="settings-page-grid">
+      <Card className="data-card" variant="default">
+        <Card.Header>
+          <div>
+            <Card.Title>Admin session</Card.Title>
+            <Card.Description>Replace the current token or end this browser session.</Card.Description>
+          </div>
           <Chip color={tokenSet ? "success" : "warning"} size="sm" variant="soft">
-            {tokenSet ? "Token set" : "Missing token"}
+            {tokenSet ? "Authenticated" : "Locked"}
           </Chip>
-          <span>Session storage</span>
-          <span>Bearer auth</span>
-        </div>
-      </Card.Content>
-    </Card>
+        </Card.Header>
+        <Card.Content className="settings-card-content">
+          <TokenForm tokenSet={tokenSet} onTokenSave={onTokenSave} />
+          <div className="access-footnote compact">
+            <LockKeyhole size={14} />
+            <span>The token remains in session storage and is never returned by the API.</span>
+          </div>
+        </Card.Content>
+      </Card>
+      <Card className="data-card" variant="default">
+        <Card.Header>
+          <div>
+            <Card.Title>Runtime policy</Card.Title>
+            <Card.Description>Read-only limits applied by the control Worker.</Card.Description>
+          </div>
+        </Card.Header>
+        <Card.Content className="runtime-policy-list">
+          <RuntimeItem label="Daily probe cap" value={formatNumber(summary.runtime.maxDailyProbes)} />
+          <RuntimeItem label="Per-monitor cap" value={formatNumber(summary.runtime.maxMonitorDailyBudget)} />
+          <RuntimeItem label="Retention" value={`${summary.runtime.retentionDays} days`} />
+          <RuntimeItem label="Probe batch" value={summary.runtime.probeBatchSize} />
+          <RuntimeItem label="Result queue batch" value={summary.runtime.resultQueueBatchSize} />
+          <RuntimeItem label="Dispatch concurrency" value={summary.runtime.dispatchConcurrency} />
+        </Card.Content>
+      </Card>
+    </div>
+  );
+}
+
+function RuntimeItem({ label, value }: { label: string; value: string | number }) {
+  return (
+    <div className="runtime-policy-row">
+      <span>{label}</span>
+      <strong>{value}</strong>
+    </div>
   );
 }
 
@@ -1531,12 +1899,13 @@ function Inspector({
   history,
   historyError,
   historyLoading,
+  mode,
   tab,
   form,
-  token,
+  createError,
   loading,
+  onClose,
   onTabChange,
-  onTokenSave,
   onMonitorSave,
   onMonitorRun,
   onHistoryRetry,
@@ -1549,12 +1918,13 @@ function Inspector({
   history: ProbeResult[];
   historyError: string | null;
   historyLoading: boolean;
+  mode: InspectorMode;
   tab: DetailTab;
   form: MonitorDraft;
-  token: string;
+  createError: string | null;
   loading: boolean;
+  onClose: () => void;
   onTabChange: (tab: DetailTab) => void;
-  onTokenSave: (value: string) => void | Promise<void>;
   onMonitorSave: (id: string, patch: MonitorConfigPatch) => void | Promise<void>;
   onMonitorRun: (id: string) => void | Promise<void>;
   onHistoryRetry: () => void;
@@ -1562,84 +1932,131 @@ function Inspector({
   onCreate: () => void;
 }) {
   const enabledRegionCount = summary.regions.filter((region) => region.enabled).length;
-  const status = monitorStatus(latest, monitor, enabledRegionCount);
+  const status = monitorStatus(latest, monitor, summary.regions);
+  const creating = mode === "create";
   return (
-    <aside className="inspector">
+    <aside aria-label={creating ? "Add monitor" : "Monitor details"} className="inspector">
       <div className="inspector-head">
         <div>
-          <h2>{monitor?.name || "No monitor"}</h2>
-          <p>{monitor?.url || "Create or select a monitor"}</p>
+          <h2>{creating ? "Add monitor" : monitor?.name || "No monitor"}</h2>
+          <p>{creating ? "Configure a target and its daily probe budget." : monitor?.url || "Select a monitor"}</p>
         </div>
-        <StatusChip status={status} />
+        <div className="inspector-head-actions">
+          {creating ? null : <StatusChip status={status} />}
+          <span title="Close panel">
+            <Button aria-label="Close panel" className="icon-button" onPress={onClose} size="sm" variant="secondary">
+              <X size={16} />
+            </Button>
+          </span>
+        </div>
       </div>
-      <Tabs
-        className="detail-tabs"
-        onSelectionChange={(key: Key) => onTabChange(String(key) as DetailTab)}
-        selectedKey={tab}
-        variant="secondary"
-      >
-        <Tabs.List>
-          {detailTabs.map((item) => (
-            <Tabs.Tab id={item.key} key={item.key}>
-              {item.label}
-            </Tabs.Tab>
-          ))}
-        </Tabs.List>
-        <Tabs.Panel id="overview">
-          <OverviewPanel enabledRegionCount={enabledRegionCount} latest={latest} monitor={monitor} />
-        </Tabs.Panel>
-        <Tabs.Panel id="history">
-          <HistoryPanel error={historyError} history={history} loading={historyLoading} onRetry={onHistoryRetry} />
-        </Tabs.Panel>
-        <Tabs.Panel id="regions">
-          <CoveragePanel latest={latest} monitor={monitor} regions={summary.regions} />
-        </Tabs.Panel>
-        <Tabs.Panel id="alerts">
-          <AlertsPanel incidents={summary.incidents.filter((incident) => incident.monitorId === monitor?.id)} />
-        </Tabs.Panel>
-        <Tabs.Panel id="settings">
-          <SettingsPanel
-            enabledRegionCount={summary.regions.filter((region) => region.enabled).length}
-            loading={loading}
-            maxDailyBudget={summary.runtime.maxMonitorDailyBudget}
-            monitor={monitor}
-            tokenSet={Boolean(token.trim())}
-            onMonitorSave={onMonitorSave}
-            onMonitorRun={onMonitorRun}
-            onTokenSave={onTokenSave}
-          />
-        </Tabs.Panel>
-      </Tabs>
-      <AddMonitorForm
-        form={form}
-        loading={loading}
-        maxDailyBudget={summary.runtime.maxMonitorDailyBudget}
-        tokenSet={Boolean(token.trim())}
-        onChange={onFormChange}
-        onCreate={onCreate}
-      />
+      {creating ? (
+        <AddMonitorForm
+          enabledRegionCount={enabledRegionCount}
+          error={createError}
+          form={form}
+          loading={loading}
+          maxDailyBudget={summary.runtime.maxMonitorDailyBudget}
+          tokenSet
+          onChange={onFormChange}
+          onCreate={onCreate}
+        />
+      ) : (
+        <Tabs
+          className="detail-tabs"
+          onSelectionChange={(key: Key) => onTabChange(String(key) as DetailTab)}
+          selectedKey={tab}
+          variant="secondary"
+        >
+          <Tabs.List>
+            {detailTabs.map((item) => (
+              <Tabs.Tab id={item.key} key={item.key}>
+                {item.label}
+              </Tabs.Tab>
+            ))}
+          </Tabs.List>
+          <Tabs.Panel id="overview">
+            <OverviewPanel
+              remainingBudget={Math.max(0, summary.runtime.maxDailyProbes - summary.usage.reservedProbes)}
+              regions={summary.regions}
+              enabledRegionCount={enabledRegionCount}
+              latest={latest}
+              loading={loading}
+              monitor={monitor}
+              onRun={onMonitorRun}
+            />
+          </Tabs.Panel>
+          <Tabs.Panel id="history">
+            <HistoryPanel error={historyError} history={history} loading={historyLoading} onRetry={onHistoryRetry} />
+          </Tabs.Panel>
+          <Tabs.Panel id="regions">
+            <CoveragePanel latest={latest} monitor={monitor} regions={summary.regions} />
+          </Tabs.Panel>
+          <Tabs.Panel id="alerts">
+            <AlertsPanel incidents={summary.incidents.filter((incident) => incident.monitorId === monitor?.id)} />
+          </Tabs.Panel>
+          <Tabs.Panel id="settings">
+            <SettingsPanel
+              enabledRegionCount={enabledRegionCount}
+              loading={loading}
+              maxDailyBudget={summary.runtime.maxMonitorDailyBudget}
+              monitor={monitor}
+              onMonitorSave={onMonitorSave}
+              onMonitorRun={onMonitorRun}
+            />
+          </Tabs.Panel>
+        </Tabs>
+      )}
     </aside>
   );
 }
 
 function OverviewPanel({
+  remainingBudget,
+  regions,
   enabledRegionCount,
   monitor,
-  latest
+  latest,
+  loading,
+  onRun
 }: {
+  remainingBudget: number;
+  regions: RegionConfig[];
   enabledRegionCount: number;
   monitor: MonitorConfig | null;
   latest: LatestResult[];
+  loading: boolean;
+  onRun: (id: string) => void | Promise<void>;
 }) {
   if (!monitor) return <div className="notice-panel">No monitor selected.</div>;
+  const status = monitorStatus(latest, monitor, regions);
   return (
-    <div className="detail-grid">
-      <InfoItem label="Status" value={monitorStatus(latest, monitor, enabledRegionCount)} />
-      <InfoItem label="Method" value={monitor.method} />
-      <InfoItem label="Last check" value={latest[0] ? relativeTime(latest[0].checkedAt) : "never"} />
-      <InfoItem label="Timeout" value={`${monitor.timeoutMs} ms`} />
-      <InfoItem label="Daily budget" value={monitor.dailyBudget} />
-      <InfoItem label="Expected" value={`${monitor.expectedStatusMin}-${monitor.expectedStatusMax}`} />
+    <div className="overview-panel">
+      {status === "unknown" ? <div className="notice-panel" role="status">Probe availability is uncertain. Inspect Regions or History before judging the website.</div> : null}
+      {status === "incomplete" ? <div className="notice-panel">Checks received so far passed. Regional coverage is still being collected.</div> : null}
+      {status === "stale" ? <div className="notice-panel">These results are older than the monitoring window. Run a sample for fresh evidence.</div> : null}
+      <div className="detail-grid">
+        <InfoItem label="Status" value={monitorStatusLabel(monitorStatus(latest, monitor, regions))} />
+        <InfoItem label="Method" value={monitor.method} />
+        <InfoItem label="Last check" value={latest[0] ? relativeTime(latest[0].checkedAt) : "never"} />
+        <InfoItem label="Timeout" value={`${monitor.timeoutMs} ms`} />
+        <InfoItem label="Daily budget" value={monitor.dailyBudget} />
+        <InfoItem label="Expected" value={`${monitor.expectedStatusMin}-${monitor.expectedStatusMax}`} />
+      </div>
+      <BudgetHint budget={monitor.effectiveDailyBudget ?? monitor.dailyBudget} regions={enabledRegionCount} />
+      {(monitor.effectiveDailyBudget ?? monitor.dailyBudget) < monitor.dailyBudget && monitor.enabled ?
+        <p className="field-note">Requested {monitor.dailyBudget}/day; effective {monitor.effectiveDailyBudget}/day after the global cap.</p> : null}
+      <Button
+        fullWidth
+        isDisabled={loading || !monitor.enabled || enabledRegionCount === 0 || remainingBudget < enabledRegionCount}
+        onPress={() => onRun(monitor.id)}
+        size="sm"
+        variant="secondary"
+      >
+        <Play size={15} />
+        Run {enabledRegionCount}-region sample
+      </Button>
+      <p className="field-note">One sample uses {enabledRegionCount} probes. {formatNumber(remainingBudget)} remain in today’s UTC budget.</p>
     </div>
   );
 }
@@ -1671,14 +2088,14 @@ function HistoryPanel({
   if (!history.length) return <div className="notice-panel">No probe history recorded for this monitor.</div>;
   return (
     <div className="history-list">
-      {history.slice(0, 40).map((result) => (
+      {history.map((result) => (
         <div className="history-row" key={result.id}>
-          <span className={`status-dot ${result.ok ? "active" : "failed"}`} />
+          <span className={`status-dot ${result.resultType === "infrastructure" ? "stale" : result.ok ? "active" : "failed"}`} />
           <div>
-            <strong>{result.regionId.toUpperCase()} · {result.status ?? result.error ?? "error"}</strong>
+            <strong>{result.regionId.toUpperCase()} · {result.resultType === "infrastructure" ? "Probe unavailable" : result.status ?? result.error ?? "error"}</strong>
             <span>{relativeTime(result.checkedAt)} · {result.latencyMs === null ? "no latency" : `${result.latencyMs} ms`}</span>
           </div>
-          <span>{result.entryColo || result.placement || "-"}</span>
+          <span title={result.error || undefined}>{result.resultType === "infrastructure" ? compactText(result.error || "Unknown", 38) : result.entryColo || result.placement || "-"}</span>
         </div>
       ))}
     </div>
@@ -1699,10 +2116,11 @@ function CoveragePanel({
   const relevant = latest.filter((item) => enabledIds.has(item.regionId));
   const stale = new Set(
     relevant
-      .filter((item) => monitor && isRegionResultStale(item, monitor, enabledRegions.length))
+      .filter((item) => monitor && isRegionResultStale(item, monitor, enabledRegions))
       .map((item) => item.regionId)
   );
-  const fresh = relevant.filter((item) => !stale.has(item.regionId));
+  const fresh = relevant.filter((item) => item.resultType !== "infrastructure" && !stale.has(item.regionId));
+  const unknown = new Set(relevant.filter((item) => item.resultType === "infrastructure").map((item) => item.regionId));
   const seen = new Set(fresh.map((item) => item.regionId));
   const failing = new Set(fresh.filter((item) => !item.ok).map((item) => item.regionId));
   return (
@@ -1719,6 +2137,8 @@ function CoveragePanel({
                 ? "region-chip paused"
                 : stale.has(region.id)
                 ? "region-chip stale"
+                : unknown.has(region.id)
+                  ? "region-chip stale"
                 : failing.has(region.id)
                   ? "region-chip danger"
                   : seen.has(region.id)
@@ -1726,6 +2146,7 @@ function CoveragePanel({
                     : "region-chip"
             }
             key={region.id}
+            title={`${region.label}: ${!region.enabled ? "Paused" : stale.has(region.id) ? "Stale evidence" : unknown.has(region.id) ? "Probe unavailable; target status unknown" : failing.has(region.id) ? "Target check failed" : seen.has(region.id) ? "Target check passed" : "Awaiting first result"}`}
           >
             {region.id.toUpperCase()}
           </span>
@@ -1761,19 +2182,15 @@ function SettingsPanel({
   loading,
   maxDailyBudget,
   enabledRegionCount,
-  tokenSet,
   onMonitorSave,
-  onMonitorRun,
-  onTokenSave
+  onMonitorRun
 }: {
   monitor: MonitorConfig | null;
   loading: boolean;
   maxDailyBudget: number;
   enabledRegionCount: number;
-  tokenSet: boolean;
   onMonitorSave: (id: string, patch: MonitorConfigPatch) => void | Promise<void>;
   onMonitorRun: (id: string) => void | Promise<void>;
-  onTokenSave: (value: string) => void | Promise<void>;
 }) {
   return (
     <div className="settings-panel">
@@ -1787,10 +2204,6 @@ function SettingsPanel({
           onSave={onMonitorSave}
         />
       ) : null}
-      <div className="settings-meta">
-        <strong>Access token</strong>
-        <TokenForm tokenSet={tokenSet} onTokenSave={onTokenSave} />
-      </div>
     </div>
   );
 }
@@ -1820,6 +2233,7 @@ function MonitorConfigForm({
 
   const savedForm = monitorToForm(monitor);
   const dirty = JSON.stringify(form) !== JSON.stringify(savedForm);
+  useDirtyDraft(`monitor:${monitor.id}`, dirty);
 
   async function save(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -1829,7 +2243,8 @@ function MonitorConfigForm({
       return;
     }
     setValidationError(null);
-    await onSave(monitor.id, parsed.patch);
+    try { await onSave(monitor.id, parsed.patch); }
+    catch (error) { setValidationError(error instanceof Error ? error.message : "Save failed. Please retry."); }
   }
 
   return (
@@ -1840,6 +2255,7 @@ function MonitorConfigForm({
           {form.enabled ? "enabled" : "paused"}
         </Chip>
       </div>
+      <BudgetHint budget={Number(form.dailyBudget)} regions={enabledRegionCount} />
       <label className="check-row">
         <input
           checked={form.enabled}
@@ -1969,12 +2385,15 @@ function MonitorConfigForm({
           {dirty ? "Save configuration" : "Saved"}
         </Button>
       </div>
+      {dirty ? <Button variant="ghost" size="sm" type="button" isDisabled={loading} onPress={() => { setForm(savedForm); setValidationError(null); }}>Reset changes</Button> : null}
       {validationError ? <div className="notice-panel danger">{validationError}</div> : null}
     </form>
   );
 }
 
 function AddMonitorForm({
+  enabledRegionCount,
+  error,
   form,
   loading,
   maxDailyBudget,
@@ -1982,6 +2401,8 @@ function AddMonitorForm({
   onChange,
   onCreate
 }: {
+  enabledRegionCount: number;
+  error: string | null;
   form: MonitorDraft;
   loading: boolean;
   maxDailyBudget: number;
@@ -1990,14 +2411,19 @@ function AddMonitorForm({
   onCreate: () => void;
 }) {
   return (
-    <Card className="create-card" variant="secondary">
-      <Card.Header>
-        <div>
-          <Card.Title>Add monitor</Card.Title>
-          <Card.Description>Budget is distributed across enabled regions.</Card.Description>
-        </div>
-      </Card.Header>
-      <Card.Content>
+    <form
+      className="create-form"
+      onSubmit={(event) => {
+        event.preventDefault();
+        onCreate();
+      }}
+    >
+      <div className="create-form-intro">
+        <Globe2 size={16} />
+        <span>Daily budget is distributed across enabled regions.</span>
+      </div>
+      <BudgetHint budget={Number(form.dailyBudget)} regions={enabledRegionCount} />
+      <div className="create-form-content">
         <LabeledField label="URL">
           <Input
             aria-label="URL"
@@ -2106,12 +2532,18 @@ function AddMonitorForm({
             variant="secondary"
           />
         </LabeledField>
-        <Button className="primary-action" fullWidth isDisabled={loading || !tokenSet} onPress={onCreate} variant="primary">
+        {error ? (
+          <div className="notice-panel danger" role="alert">
+            <AlertTriangle size={16} />
+            <span>{error}</span>
+          </div>
+        ) : null}
+        <Button className="primary-action" fullWidth isDisabled={loading || !tokenSet} type="submit" variant="primary">
           <Plus size={16} />
-          {tokenSet ? "Create Monitor" : "Token required"}
+          {tokenSet ? "Create monitor" : "Token required"}
         </Button>
-      </Card.Content>
-    </Card>
+      </div>
+    </form>
   );
 }
 
@@ -2122,6 +2554,16 @@ function LabeledField({ label, children }: { label: string; children: ReactNode 
       {children}
     </label>
   );
+}
+
+function BudgetHint({ budget, regions }: { budget: number; regions: number }) {
+  if (!Number.isFinite(budget) || budget <= 0) return <p className="field-note">No automatic checks allocated.</p>;
+  const minutes = 1440 / budget;
+  const formatInterval = (value: number) => value < 1 ? "less than a minute" : value < 60 ? `${Math.round(value * 10) / 10} min` : `${Math.round(value / 6) / 10} hr`;
+  return <div className="strategy-note">
+    <strong>One scheduled check about every {formatInterval(minutes)}</strong>
+    <span>{regions > 0 ? `About ${formatInterval(minutes * regions)} per region at equal weights. Regions rotate; this is not a simultaneous global check.` : "Enable a region to start checking."}</span>
+  </div>;
 }
 
 function InfoItem({ label, value }: { label: string; value: string | number }) {
@@ -2138,9 +2580,23 @@ function StatusChip({ status }: { status: MonitorStatus }) {
   return (
     <Chip color={color} size="sm" variant="soft">
       <CircleDot size={12} />
-      {status}
+      {monitorStatusLabel(status)}
     </Chip>
   );
+}
+
+function monitorStatusLabel(status: MonitorStatus): string {
+  const labels: Record<MonitorStatus, string> = {
+    up: "Up",
+    down: "Down",
+    partial: "Degraded",
+    unknown: "Unknown",
+    incomplete: "Gathering",
+    stale: "Stale",
+    paused: "Paused",
+    idle: "Not checked"
+  };
+  return labels[status];
 }
 
 function CoverageMini({ checked, total }: { checked: number; total: number }) {
@@ -2150,7 +2606,7 @@ function CoverageMini({ checked, total }: { checked: number; total: number }) {
       <span>{checked} / {total}</span>
       <div>
         {blocks.map((_, index) => (
-          <i className={index < checked ? "on" : ""} key={index} />
+          <i className={index < Math.round(blocks.length * checked / Math.max(1, total)) ? "on" : ""} key={index} />
         ))}
       </div>
     </div>
@@ -2169,7 +2625,11 @@ function Toast({ tone, message }: { tone: "success" | "danger" | "info"; message
 interface HealthSummary {
   up: number;
   down: number;
+  partial: number;
   stale: number;
+  unknown: number;
+  incomplete: number;
+  paused: number;
   idle: number;
   budgetPct: number;
 }
@@ -2177,23 +2637,35 @@ interface HealthSummary {
 function computeHealth(summary: Summary, latestByMonitor: Map<string, LatestResult[]>): HealthSummary {
   let up = 0;
   let down = 0;
+  let partial = 0;
   let stale = 0;
+  let unknown = 0;
+  let incomplete = 0;
+  let paused = 0;
   let idle = 0;
   const totalBudget = summary.monitors.reduce((total, monitor) => total + (monitor.enabled ? monitor.dailyBudget : 0), 0);
   const enabledRegions = summary.regions.filter((region) => region.enabled);
   const enabledRegionIds = new Set(enabledRegions.map((region) => region.id));
   for (const monitor of summary.monitors) {
     const relevant = (latestByMonitor.get(monitor.id) || []).filter((item) => enabledRegionIds.has(item.regionId));
-    const status = monitorStatus(relevant, monitor, enabledRegions.length);
+    const status = monitorStatus(relevant, monitor, enabledRegions);
     if (status === "up") up += 1;
-    else if (status === "down" || status === "partial") down += 1;
+    else if (status === "down") down += 1;
+    else if (status === "partial") partial += 1;
     else if (status === "stale") stale += 1;
+    else if (status === "unknown") unknown += 1;
+    else if (status === "incomplete") incomplete += 1;
+    else if (status === "paused") paused += 1;
     else idle += 1;
   }
   return {
     up,
     down,
+    partial,
     stale,
+    unknown,
+    incomplete,
+    paused,
     idle,
     budgetPct: totalBudget ? Math.min(100, Math.round((summary.usage.reservedProbes / totalBudget) * 100)) : 0
   };
@@ -2211,7 +2683,7 @@ function filterMonitors(
   const enabledRegionIds = new Set(enabledRegions.map((region) => region.id));
   return monitors.filter((monitor) => {
     const relevant = (latestByMonitor.get(monitor.id) || []).filter((item) => enabledRegionIds.has(item.regionId));
-    const status = monitorStatus(relevant, monitor, enabledRegions.length);
+    const status = monitorStatus(relevant, monitor, enabledRegions);
     if (statusFilter !== "all" && status !== statusFilter) return false;
     if (!normalized) return true;
     return [monitor.name, monitor.url, monitor.method, ...monitor.tags]
@@ -2226,34 +2698,10 @@ function groupLatest(items: LatestResult[]) {
   for (const item of items) {
     const list = map.get(item.monitorId) || [];
     list.push(item);
-    list.sort((a, b) => b.checkedAt.localeCompare(a.checkedAt));
     map.set(item.monitorId, list);
   }
+  for (const list of map.values()) list.sort((a, b) => b.checkedAt.localeCompare(a.checkedAt));
   return map;
-}
-
-function monitorStatus(
-  latest: LatestResult[],
-  monitor: MonitorConfig | null = null,
-  enabledRegionCount = Math.max(1, latest.length)
-): MonitorStatus {
-  if (monitor && !monitor.enabled) return "paused";
-  if (!latest.length) return "idle";
-  const fresh = monitor
-    ? latest.filter((item) => !isRegionResultStale(item, monitor, enabledRegionCount))
-    : latest;
-  if (!fresh.length) return "stale";
-  const failures = fresh.filter((item) => !item.ok).length;
-  if (fresh.length < Math.max(1, enabledRegionCount)) return "partial";
-  if (failures > 0 && failures < fresh.length) return "partial";
-  return failures > 0 ? "down" : "up";
-}
-
-function isRegionResultStale(result: LatestResult, monitor: MonitorConfig, enabledRegionCount: number): boolean {
-  const expectedRegionalInterval =
-    (86_400_000 * Math.max(1, enabledRegionCount)) / Math.max(1, monitor.dailyBudget);
-  const staleAfter = Math.max(2 * 60 * 60_000, expectedRegionalInterval * 3);
-  return Date.now() - new Date(result.checkedAt).getTime() > staleAfter;
 }
 
 function regionOperationalState(region: RegionConfig): "active" | "paused" | "unconfigured" | "stale" {
@@ -2288,10 +2736,6 @@ function formatNumber(value: number) {
 
 function compactText(value: string, max = 64) {
   return value.length > max ? `${value.slice(0, max - 1)}...` : value;
-}
-
-function viewLabel(view: ViewKey) {
-  return navItems.find((item) => item.key === view)?.label || "Overview";
 }
 
 function monitorToForm(monitor: MonitorConfig) {

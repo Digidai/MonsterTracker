@@ -28,8 +28,8 @@ describe("result persistence guardrails", () => {
     } satisfies ProbeResult;
 
     await expect(
-      saveProbeResults({} as RuntimeEnv, Array.from({ length: 6 }, (_, index) => ({ ...result, id: `result_${index}` })))
-    ).rejects.toThrow("5-result D1 safety limit");
+      saveProbeResults({} as RuntimeEnv, Array.from({ length: 11 }, (_, index) => ({ ...result, id: `result_${index}` })))
+    ).rejects.toThrow("10-result D1 safety limit");
   });
 });
 

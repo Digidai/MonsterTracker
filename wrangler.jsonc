@@ -8,7 +8,7 @@
     "directory": "./dist/client",
     "binding": "ASSETS",
     "not_found_handling": "single-page-application",
-    "run_worker_first": true
+    "run_worker_first": ["/api/*", "/internal/*", "/health"]
   },
   "observability": {
     "enabled": true,
@@ -21,7 +21,7 @@
     "DEFAULT_DAILY_PROBE_BUDGET": "100",
     "DEFAULT_RETENTION_DAYS": "30",
     "PROBE_BATCH_SIZE": "5",
-    "RESULT_QUEUE_BATCH_SIZE": "5",
+    "RESULT_QUEUE_BATCH_SIZE": "10",
     "PROBE_CONCURRENCY": "6",
     "DISPATCH_CONCURRENCY": "6",
     "MAX_PROBE_RESPONSE_BYTES": "512000",

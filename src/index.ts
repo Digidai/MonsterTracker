@@ -1,8 +1,9 @@
 import { requireAdmin, requireInternal } from "./auth";
+import { applyGlobalDailyCap } from "./budget";
 import { estimateCost } from "./cost";
 import { dispatchJobs } from "./dispatch";
 import type { ProbeJob, ProbeResult, RuntimeEnv } from "./domain";
-import { createId, nowIso, parsePositiveInt } from "./domain";
+import { createId, nowIso, parsePositiveInt, RESULT_BATCH_LIMIT } from "./domain";
 import { parseProbeJobs, runProbeJobs } from "./probe";
 import { buildSchedulePlan } from "./scheduler";
 import {
@@ -23,6 +24,7 @@ import {
   recordSchedulerRun,
   recordWorkerInvocation,
   reserveProbeBudget,
+  retryScheduledRun,
   saveProbeResults,
   updateMonitor,
   updateRegion
@@ -40,23 +42,47 @@ export default {
       return handleProbeRole(request, env);
     }
 
-    return handleControlRequest(request, env, ctx, url);
+    try {
+      const response = await handleControlRequest(request, env, ctx, url);
+      if (url.pathname.startsWith("/api/")) {
+        response.headers.set("Cache-Control", "private, no-store");
+        response.headers.set("X-Content-Type-Options", "nosniff");
+      }
+      return response;
+    } catch (error) {
+      console.error("control_request_failed", error instanceof Error ? error.message : error);
+      return Response.json({ error: error instanceof DirectPersistenceLimitError
+        ? error.message : "Service temporarily unavailable. Please retry." }, {
+        status: 503, headers: { "Cache-Control": "private, no-store" }
+      });
+    }
   },
 
   async scheduled(event: ScheduledEvent, env: RuntimeEnv, ctx: ExecutionContext): Promise<void> {
+    const directPersistence = directPersistenceGuard(env);
+    env = directPersistence.env;
     await bootstrapDefaults(env);
     await expireStaleIncidents(env);
     const baseUrl = env.PUBLIC_BASE_URL || "http://localhost:8787";
-    const recovered = await claimRecoverableSchedulerRun(env);
-    if (recovered) {
-      await executeScheduledJobs(env, ctx, recovered, baseUrl);
-    }
-
     const scheduledAt = event.scheduledTime ? new Date(event.scheduledTime) : new Date();
     const monitors = applyGlobalDailyCap(await listMonitors(env), parsePositiveInt(env.MAX_DAILY_PROBES, 10_000));
     const regions = await listRegions(env);
     const runId = scheduledRunId(scheduledAt);
     const plan = buildSchedulePlan(monitors, regions, scheduledAt, runId);
+    if (scheduledAt.getUTCMinutes() === 0) {
+      ctx.waitUntil(cleanupRetention(env).catch((caught) => logBackgroundFailure("retention_cleanup_failed", caught)));
+    }
+    const recovered = await claimRecoverableSchedulerRun(env, (jobs) => {
+      // One recovery claim, two completion writes per run, and four statements
+      // for the new minute's claim/reservation. Check both runs before either
+      // dispatches; a persistence chunk does not get a fresh invocation budget.
+      directPersistence.assertCapacity([jobs.length, plan.jobs.length], 3 + (plan.jobs.length ? 6 : 0));
+    });
+    if (recovered) {
+      await executeScheduledJobs(env, ctx, recovered, baseUrl);
+    }
+    if (!plan.jobs.length) return;
+    directPersistence.assertCapacity([plan.jobs.length], 6);
     const startedAt = scheduledAt.toISOString();
     const claim = await claimScheduledRunAndReserve(
       env,
@@ -68,12 +94,11 @@ export default {
     if (!claim.claimed) return;
     if (!claim.reserved) return;
     await executeScheduledJobs(env, ctx, { id: runId, startedAt, jobs: plan.jobs }, baseUrl);
-    ctx.waitUntil(cleanupRetention(env).catch((caught) => logBackgroundFailure("retention_cleanup_failed", caught)));
   },
 
   async queue(batch: MessageBatch<ProbeResult[]>, env: RuntimeEnv, ctx: ExecutionContext): Promise<void> {
     const incoming = batch.messages.flatMap((message) => message.body);
-    const batchSize = Math.min(5, parsePositiveInt(env.RESULT_QUEUE_BATCH_SIZE, 5));
+    const batchSize = Math.min(RESULT_BATCH_LIMIT, parsePositiveInt(env.RESULT_QUEUE_BATCH_SIZE, RESULT_BATCH_LIMIT));
     const results = incoming.slice(0, batchSize);
     const remainder = incoming.slice(batchSize);
     await archiveProbeResults(env, results);
@@ -110,15 +135,7 @@ async function executeScheduledJobs(
     });
     await recordWorkerInvocationSafely(env, 1 + outcome.probeInvocations);
   } catch (caught) {
-    await recordSchedulerRunSafely(env, {
-      id: run.id,
-      startedAt: run.startedAt,
-      finishedAt: nowIso(),
-      plannedJobs: run.jobs.length,
-      dispatchedJobs: 0,
-      skippedJobs: run.jobs.length,
-      error: caught instanceof Error ? caught.message : "scheduled_run_failed"
-    });
+    await retryScheduledRun(env, run.id, caught instanceof Error ? caught.message : "scheduled_run_failed");
     console.error("scheduled_run_failed", run.id, caught instanceof Error ? caught.message : caught);
   }
 }
@@ -143,7 +160,7 @@ async function handleControlRequest(
     const urlCount = Number.parseInt(url.searchParams.get("urls") ?? "1", 10);
     const probesPerDay = Number.parseInt(url.searchParams.get("probesPerDay") ?? "100", 10);
     const queueBatchSize = Number.parseInt(
-      url.searchParams.get("queueBatchSize") ?? env.RESULT_QUEUE_BATCH_SIZE ?? "5",
+      url.searchParams.get("queueBatchSize") ?? env.RESULT_QUEUE_BATCH_SIZE ?? String(RESULT_BATCH_LIMIT),
       10
     );
     return Response.json(estimateCost({ urlCount, probesPerDay, queueBatchSize }));
@@ -211,8 +228,11 @@ async function handleControlRequest(
   if (request.method === "POST" && url.pathname === "/api/run") {
     const unauthorized = requireAdmin(request, env);
     if (unauthorized) return unauthorized;
+    const directPersistence = directPersistenceGuard(env);
+    env = directPersistence.env;
     await bootstrapDefaults(env);
     const payload = parseRunRequestInput(await request.json().catch(() => ({})));
+    if (payload.mode === "due" && payload.monitorId) return jsonError("Due checks cover the global schedule. Use sample for a single monitor.", 400);
     let monitors = applyGlobalDailyCap(await listMonitors(env), parsePositiveInt(env.MAX_DAILY_PROBES, 10_000));
     if (payload.monitorId) {
       const selected = monitors.find((monitor) => monitor.id === payload.monitorId);
@@ -222,17 +242,26 @@ async function handleControlRequest(
     }
     const regions = await listRegions(env);
     const scheduledAt = new Date();
-    const runId = createId("manual");
+    const runId = payload.mode === "due" ? scheduledRunId(scheduledAt) : createId("manual");
     const startedAt = nowIso();
     const jobs =
       payload.mode === "due"
         ? buildSchedulePlan(monitors, regions, scheduledAt, runId).jobs
         : buildSampleJobs(monitors, regions, scheduledAt, runId, payload.monitorId ? "all-regions" : "one-per-monitor");
-    const budgetReserved = await reserveProbeBudget(
-      env,
-      jobs.length,
-      parsePositiveInt(env.MAX_DAILY_PROBES, 10_000)
-    );
+    if (!jobs.length) return Response.json({ runId: null, plannedJobs: 0, dispatchedJobs: 0,
+      successfulJobs: 0, failedJobs: 0, unknownJobs: 0, queued: false, mode: payload.mode,
+      reason: regions.some((region) => region.enabled) ? "no_due_jobs" : "no_enabled_regions" });
+    directPersistence.assertCapacity([jobs.length], payload.mode === "due" ? 6 : 4);
+    let budgetReserved: boolean;
+    if (payload.mode === "due") {
+      const claim = await claimScheduledRunAndReserve(env, { id: runId, startedAt, plannedJobs: jobs.length }, jobs,
+        parsePositiveInt(env.MAX_DAILY_PROBES, 10_000), scheduledAt.toISOString().slice(0, 10));
+      if (!claim.claimed) return Response.json({ runId, plannedJobs: jobs.length, dispatchedJobs: 0,
+        successfulJobs: 0, failedJobs: 0, unknownJobs: 0, queued: true, mode: "due", reason: "already_scheduled" }, { status: 202 });
+      budgetReserved = claim.reserved;
+    } else {
+      budgetReserved = await reserveProbeBudget(env, jobs.length, parsePositiveInt(env.MAX_DAILY_PROBES, 10_000));
+    }
     if (!budgetReserved) {
       await recordSchedulerRunSafely(env, {
         id: runId,
@@ -262,7 +291,8 @@ async function handleControlRequest(
         plannedJobs: jobs.length,
         dispatchedJobs: outcome.dispatchedJobs,
         successfulJobs: outcome.results.filter((result) => result.ok).length,
-        failedJobs: outcome.results.filter((result) => !result.ok).length,
+        failedJobs: outcome.results.filter((result) => !result.ok && result.resultType !== "infrastructure").length,
+        unknownJobs: outcome.results.filter((result) => result.resultType === "infrastructure").length,
         queued: Boolean(env.RESULTS_QUEUE),
         mode: payload.mode,
         reason:
@@ -273,15 +303,19 @@ async function handleControlRequest(
               : "no_enabled_regions"
       });
     } catch (caught) {
-      await recordSchedulerRunSafely(env, {
-        id: runId,
-        startedAt,
-        finishedAt: nowIso(),
-        plannedJobs: jobs.length,
-        dispatchedJobs: 0,
-        skippedJobs: jobs.length,
-        error: caught instanceof Error ? caught.message : "manual_run_failed"
-      });
+      if (payload.mode === "due") {
+        await retryScheduledRun(env, runId, caught instanceof Error ? caught.message : "manual_run_failed");
+      } else {
+        await recordSchedulerRunSafely(env, {
+          id: runId,
+          startedAt,
+          finishedAt: nowIso(),
+          plannedJobs: jobs.length,
+          dispatchedJobs: 0,
+          skippedJobs: jobs.length,
+          error: caught instanceof Error ? caught.message : "manual_run_failed"
+        });
+      }
       return jsonError(caught instanceof Error ? caught.message : "Run failed.", 500);
     }
   }
@@ -332,7 +366,7 @@ async function handleInternalProbe(request: Request, env: RuntimeEnv): Promise<R
 async function persistResults(env: RuntimeEnv, ctx: ExecutionContext, results: ProbeResult[]): Promise<void> {
   if (results.length === 0) return;
   if (env.RESULTS_QUEUE) {
-    const chunkSize = Math.min(5, parsePositiveInt(env.RESULT_QUEUE_BATCH_SIZE, 5));
+    const chunkSize = Math.min(RESULT_BATCH_LIMIT, parsePositiveInt(env.RESULT_QUEUE_BATCH_SIZE, RESULT_BATCH_LIMIT));
     let messages = 0;
     for (let index = 0; index < results.length; index += chunkSize) {
       await env.RESULTS_QUEUE.send(results.slice(index, index + chunkSize));
@@ -342,12 +376,67 @@ async function persistResults(env: RuntimeEnv, ctx: ExecutionContext, results: P
     return;
   }
 
-  const chunkSize = Math.min(5, parsePositiveInt(env.RESULT_QUEUE_BATCH_SIZE, 5));
+  const chunkSize = Math.min(RESULT_BATCH_LIMIT, parsePositiveInt(env.RESULT_QUEUE_BATCH_SIZE, RESULT_BATCH_LIMIT));
   for (let index = 0; index < results.length; index += chunkSize) {
     const chunk = results.slice(index, index + chunkSize);
     await archiveProbeResults(env, chunk);
     await saveProbeResults(env, chunk);
   }
+}
+
+class DirectPersistenceLimitError extends Error {
+  constructor() {
+    super("RESULTS_QUEUE is required for this run: direct persistence would exceed the 50-query D1 Free invocation limit. Configure the Queue binding or reduce the run size.");
+  }
+}
+
+function directPersistenceGuard(env: RuntimeEnv): {
+  env: RuntimeEnv;
+  assertCapacity: (runs: number[], remainingQueries: number) => void;
+} {
+  if (env.RESULTS_QUEUE) return { env, assertCapacity: () => {} };
+  let used = 0;
+  const originals = new WeakMap<D1PreparedStatement, D1PreparedStatement>();
+  const consume = (count: number) => {
+    if (used + count > 50) throw new DirectPersistenceLimitError();
+    used += count;
+  };
+  const wrap = (statement: D1PreparedStatement): D1PreparedStatement => {
+    const counted = new Proxy(statement, {
+      get(target, key) {
+        if (key === "bind") return (...values: unknown[]) => wrap(target.bind(...values));
+        const value = Reflect.get(target, key, target);
+        if (typeof value !== "function") return value;
+        return (...args: unknown[]) => {
+          if (key === "all" || key === "first" || key === "run" || key === "raw") consume(1);
+          return value.apply(target, args);
+        };
+      }
+    });
+    originals.set(counted, statement);
+    return counted;
+  };
+  const db = new Proxy(env.DB, {
+    get(target, key) {
+      if (key === "prepare") return (sql: string) => wrap(target.prepare(sql));
+      if (key === "batch") return (statements: D1PreparedStatement[]) => {
+        consume(statements.length);
+        return target.batch(statements.map((statement) => originals.get(statement) ?? statement));
+      };
+      const value = Reflect.get(target, key, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    }
+  });
+  return {
+    env: { ...env, DB: db },
+    assertCapacity(runs, remainingQueries) {
+      const batchSize = Math.min(RESULT_BATCH_LIMIT, parsePositiveInt(env.RESULT_QUEUE_BATCH_SIZE, RESULT_BATCH_LIMIT));
+      // Three result statements plus nine usage/analytics/incident statements
+      // per nonempty chunk; completion/reservation queries come from the caller.
+      const persistenceQueries = runs.reduce((sum, count) => sum + 3 * count + 9 * Math.ceil(count / batchSize), 0);
+      if (used + persistenceQueries + remainingQueries > 50) throw new DirectPersistenceLimitError();
+    }
+  };
 }
 
 function buildSampleJobs(
@@ -475,43 +564,7 @@ function scheduledRunId(date: Date): string {
   return `cron_${date.toISOString().slice(0, 16).replace(/[-:T]/g, "")}`;
 }
 
-export function applyGlobalDailyCap<T extends { dailyBudget: number; enabled?: boolean; id?: string }>(
-  monitors: T[],
-  maxDailyProbes: number
-): T[] {
-  const cap = Math.max(0, Math.floor(maxDailyProbes));
-  const enabled = monitors
-    .map((monitor, index) => ({ index, monitor, budget: Math.max(0, Math.floor(monitor.dailyBudget)) }))
-    .filter((item) => item.monitor.enabled !== false && item.budget > 0);
-  const totalBudget = enabled.reduce((total, item) => total + item.budget, 0);
-  if (totalBudget <= cap) return monitors;
-
-  const allocations = enabled.map((item) => {
-    const exact = totalBudget > 0 ? (item.budget / totalBudget) * cap : 0;
-    return {
-      ...item,
-      allocation: Math.min(item.budget, Math.floor(exact)),
-      remainder: exact - Math.floor(exact)
-    };
-  });
-  let remaining = cap - allocations.reduce((total, item) => total + item.allocation, 0);
-  const remainderOrder = [...allocations].sort(
-    (left, right) =>
-      right.remainder - left.remainder ||
-      (left.monitor.id ?? String(left.index)).localeCompare(right.monitor.id ?? String(right.index))
-  );
-  for (const item of remainderOrder) {
-    if (remaining <= 0) break;
-    if (item.allocation >= item.budget) continue;
-    item.allocation += 1;
-    remaining -= 1;
-  }
-
-  const byIndex = new Map(allocations.map((item) => [item.index, item.allocation]));
-  return monitors.map((monitor, index) =>
-    byIndex.has(index) ? { ...monitor, dailyBudget: byIndex.get(index) ?? 0 } : monitor
-  );
-}
+export { applyGlobalDailyCap } from "./budget";
 
 function jsonError(message: string, status: number): Response {
   return Response.json({ error: message }, { status });

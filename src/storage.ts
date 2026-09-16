@@ -14,6 +14,7 @@ import type {
   UsageSummary
 } from "./domain";
 import {
+  RESULT_BATCH_LIMIT,
   DEFAULT_EXPECTED_STATUS_MAX,
   DEFAULT_EXPECTED_STATUS_MIN,
   MAX_BODY_MATCH_BYTES,
@@ -29,6 +30,9 @@ import {
 } from "./domain";
 import { getRegionSeeds, probeWorkerName } from "./regions";
 import { normalizeTargetUrl, normalizeWorkerUrl } from "./validation";
+
+import { applyGlobalDailyCap } from "./budget";
+import { regionalFreshnessMs } from "./health";
 
 type DbRow = Record<string, unknown>;
 
@@ -251,7 +255,7 @@ export async function updateMonitor(
             status = 'resolved',
             closed_at = ?,
             summary = ?
-           WHERE monitor_id = ? AND status = 'open'
+           WHERE monitor_id = ? AND status IN ('open', 'unknown')
              AND EXISTS (SELECT 1 FROM monitors WHERE id = ? AND last_mutation_id = ?)`
         ).bind(
           updatedAt,
@@ -346,7 +350,7 @@ export async function listRegions(env: RuntimeEnv): Promise<RegionConfig[]> {
 
 export async function listLatest(env: RuntimeEnv): Promise<LatestResult[]> {
   const result = await env.DB.prepare(
-    "SELECT * FROM monitor_latest ORDER BY checked_at DESC LIMIT 1000"
+    "SELECT * FROM monitor_latest ORDER BY checked_at DESC"
   ).all<DbRow>();
   return (result.results ?? []).map(mapLatest);
 }
@@ -354,7 +358,7 @@ export async function listLatest(env: RuntimeEnv): Promise<LatestResult[]> {
 export async function listIncidents(env: RuntimeEnv, limit = 100): Promise<Incident[]> {
   const safeLimit = normalizeLimit(limit, 100, 500);
   const result = await env.DB.prepare(
-    "SELECT * FROM incidents ORDER BY opened_at DESC LIMIT ?"
+    "SELECT * FROM incidents ORDER BY (status IN ('open', 'unknown')) DESC, opened_at DESC LIMIT ?"
   )
     .bind(safeLimit)
     .all<DbRow>();
@@ -395,7 +399,8 @@ export async function getRunStatus(env: RuntimeEnv, id: string): Promise<RunStat
     `SELECT
        COUNT(*) AS stored_results,
        SUM(CASE WHEN ok = 1 THEN 1 ELSE 0 END) AS successful_results,
-       SUM(CASE WHEN ok = 0 THEN 1 ELSE 0 END) AS failed_results
+       SUM(CASE WHEN ok = 0 AND result_type = 'target' THEN 1 ELSE 0 END) AS failed_results,
+       SUM(CASE WHEN result_type = 'infrastructure' THEN 1 ELSE 0 END) AS unknown_results
      FROM probe_results
      WHERE run_id = ?`
   )
@@ -408,6 +413,7 @@ export async function getRunStatus(env: RuntimeEnv, id: string): Promise<RunStat
     storedResults,
     successfulResults: numberField(counts ?? {}, "successful_results"),
     failedResults: numberField(counts ?? {}, "failed_results"),
+    unknownResults: numberField(counts ?? {}, "unknown_results"),
     pendingResults: run.error && run.finishedAt ? 0 : Math.max(0, run.plannedJobs - storedResults)
   };
 }
@@ -457,7 +463,7 @@ export function getRuntimeSettings(env: RuntimeEnv): RuntimeSettings {
     maxMonitorDailyBudget: parsePositiveInt(env.MAX_MONITOR_DAILY_BUDGET, 10_000),
     retentionDays: parsePositiveInt(env.DEFAULT_RETENTION_DAYS, 30),
     probeBatchSize: Math.min(5, parsePositiveInt(env.PROBE_BATCH_SIZE, 5)),
-    resultQueueBatchSize: Math.min(5, parsePositiveInt(env.RESULT_QUEUE_BATCH_SIZE, 5)),
+    resultQueueBatchSize: Math.min(RESULT_BATCH_LIMIT, parsePositiveInt(env.RESULT_QUEUE_BATCH_SIZE, RESULT_BATCH_LIMIT)),
     probeConcurrency: Math.min(6, parsePositiveInt(env.PROBE_CONCURRENCY, 6)),
     dispatchConcurrency: Math.min(6, parsePositiveInt(env.DISPATCH_CONCURRENCY, 6)),
     probeWorkerHostSuffix: env.PROBE_WORKER_HOST_SUFFIX || ".workers.dev"
@@ -476,7 +482,7 @@ export async function recordSchedulerRun(env: RuntimeEnv, input: RecordScheduler
       dispatched_jobs = excluded.dispatched_jobs,
       skipped_jobs = excluded.skipped_jobs,
       error = excluded.error,
-      lease_expires_at = NULL`
+      lease_expires_at = CASE WHEN excluded.finished_at IS NOT NULL THEN NULL ELSE scheduler_runs.lease_expires_at END`
   )
     .bind(
       input.id,
@@ -488,6 +494,14 @@ export async function recordSchedulerRun(env: RuntimeEnv, input: RecordScheduler
       input.error ?? null
     )
     .run();
+}
+
+export async function retryScheduledRun(env: RuntimeEnv, id: string, error: string): Promise<void> {
+  const now = nowIso();
+  await env.DB.prepare(`UPDATE scheduler_runs SET error = ?,
+    finished_at = CASE WHEN attempt_count >= 3 THEN ? ELSE NULL END,
+    lease_expires_at = CASE WHEN attempt_count >= 3 THEN NULL ELSE ? END
+    WHERE id = ? AND finished_at IS NULL`).bind(error.slice(0, 512), now, new Date(Date.now() + 60_000).toISOString(), id).run();
 }
 
 export async function claimScheduledRunAndReserve(
@@ -538,26 +552,29 @@ export async function claimScheduledRunAndReserve(
 }
 
 export async function claimRecoverableSchedulerRun(
-  env: RuntimeEnv
+  env: RuntimeEnv,
+  beforeClaim?: (jobs: ProbeJob[]) => void
 ): Promise<{ id: string; startedAt: string; jobs: ProbeJob[] } | null> {
   const now = nowIso();
   const leaseExpiresAt = new Date(Date.now() + 16 * 60_000).toISOString();
+  // A killed invocation never reaches retryScheduledRun. Retire its third
+  // expired lease here so crash recovery cannot dispatch a fourth attempt.
+  await env.DB.prepare(`UPDATE scheduler_runs
+    SET finished_at = ?, lease_expires_at = NULL, error = 'scheduler_retry_limit_exhausted'
+    WHERE finished_at IS NULL AND attempt_count >= 3 AND lease_expires_at <= ?`
+  ).bind(now, now).run();
   const row = await env.DB.prepare(
-    `UPDATE scheduler_runs
-     SET lease_expires_at = ?, attempt_count = attempt_count + 1
-     WHERE id = (
-       SELECT id
+    `SELECT id, started_at, jobs_json
        FROM scheduler_runs
        WHERE finished_at IS NULL
+         AND attempt_count < 3
          AND jobs_json IS NOT NULL
          AND lease_expires_at IS NOT NULL
          AND lease_expires_at <= ?
        ORDER BY started_at ASC
-       LIMIT 1
-     )
-     RETURNING id, started_at, jobs_json`
+       LIMIT 1`
   )
-    .bind(leaseExpiresAt, now)
+    .bind(now)
     .first<{ id: string; started_at: string; jobs_json: string }>();
   if (!row) return null;
   let jobs: unknown;
@@ -578,6 +595,14 @@ export async function claimRecoverableSchedulerRun(
     });
     return null;
   }
+  beforeClaim?.(jobs as ProbeJob[]);
+  // Recheck the lease atomically: another invocation may have claimed the row
+  // after the read/preflight above.
+  const claim = await env.DB.prepare(`UPDATE scheduler_runs
+    SET lease_expires_at = ?, attempt_count = attempt_count + 1
+    WHERE id = ? AND finished_at IS NULL AND attempt_count < 3 AND lease_expires_at <= ?`
+  ).bind(leaseExpiresAt, row.id, now).run();
+  if ((claim.meta.changes ?? 0) === 0) return null;
   return { id: row.id, startedAt: row.started_at, jobs: jobs as ProbeJob[] };
 }
 
@@ -611,7 +636,7 @@ export async function reserveProbeBudget(
 
 export async function saveProbeResults(env: RuntimeEnv, results: ProbeResult[]): Promise<ProbeResult[]> {
   if (results.length === 0) return [];
-  if (results.length > 5) throw new Error("Result persistence batch exceeds the 5-result D1 safety limit.");
+  if (results.length > RESULT_BATCH_LIMIT) throw new Error("Result persistence batch exceeds the 10-result D1 safety limit.");
   const insertedResults = await saveProbeResultChunk(env, results);
   await applyResultUsage(env, results);
   await writePendingAnalytics(env, results.map((result) => result.id));
@@ -627,8 +652,8 @@ async function saveProbeResultChunk(env: RuntimeEnv, results: ProbeResult[]): Pr
         `INSERT INTO probe_results (
           id, run_id, monitor_id, monitor_config_version, region_id, target_url, checked_at, ok, status, latency_ms,
           error, method, entry_colo, entry_country, entry_city, entry_asn, entry_as_organization,
-          placement, response_bytes, usage_applied, analytics_applied
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0)
+          placement, response_bytes, result_type, usage_applied, analytics_applied
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0)
         ON CONFLICT(id) DO NOTHING`
       ).bind(
         result.id,
@@ -649,20 +674,21 @@ async function saveProbeResultChunk(env: RuntimeEnv, results: ProbeResult[]): Pr
         result.entryAsn,
         result.entryAsOrganization,
         result.placement,
-        result.responseBytes
+        result.responseBytes,
+        result.resultType ?? (!result.ok && result.status === null && result.latencyMs === null
+          ? "infrastructure" : "target")
       )
     );
     statements.push(
       env.DB.prepare(
         `INSERT INTO monitor_latest (
           monitor_id, region_id, result_id, checked_at, ok, status, latency_ms,
-          error, entry_colo, placement
+          error, entry_colo, placement, result_type
         )
-        SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
-        WHERE EXISTS (
-          SELECT 1 FROM monitors
-          WHERE id = ? AND enabled = 1 AND config_version = ?
-        )
+        SELECT result.monitor_id, result.region_id, result.id, result.checked_at, result.ok,
+          result.status, result.latency_ms, result.error, result.entry_colo, result.placement, result.result_type
+        FROM probe_results AS result JOIN monitors AS monitor ON monitor.id = result.monitor_id
+        WHERE result.id = ? AND monitor.enabled = 1 AND monitor.config_version = result.monitor_config_version
         ON CONFLICT(monitor_id, region_id) DO UPDATE SET
           result_id = excluded.result_id,
           checked_at = excluded.checked_at,
@@ -671,23 +697,11 @@ async function saveProbeResultChunk(env: RuntimeEnv, results: ProbeResult[]): Pr
           latency_ms = excluded.latency_ms,
           error = excluded.error,
           entry_colo = excluded.entry_colo,
-          placement = excluded.placement
+          placement = excluded.placement,
+          result_type = excluded.result_type
         WHERE excluded.checked_at > monitor_latest.checked_at
            OR (excluded.checked_at = monitor_latest.checked_at AND excluded.result_id > monitor_latest.result_id)`
-      ).bind(
-        result.monitorId,
-        result.regionId,
-        result.id,
-        result.checkedAt,
-        result.ok ? 1 : 0,
-        result.status,
-        result.latencyMs,
-        result.error,
-        result.entryColo,
-        result.placement,
-        result.monitorId,
-        result.monitorConfigVersion
-      )
+      ).bind(result.id)
     );
     statements.push(
       env.DB.prepare(
@@ -724,31 +738,31 @@ async function saveProbeResultChunk(env: RuntimeEnv, results: ProbeResult[]): Pr
 }
 
 async function applyResultUsage(env: RuntimeEnv, results: ProbeResult[]): Promise<void> {
-  const ids = [...new Set(results.map((result) => result.id))].slice(0, 5);
+  const ids = [...new Set(results.map((result) => result.id))].slice(0, RESULT_BATCH_LIMIT);
   if (ids.length === 0) return;
   const placeholders = ids.map(() => "?").join(", ");
-  const resultDate = results[0]?.checkedAt.slice(0, 10) || new Date().toISOString().slice(0, 10);
   const now = nowIso();
   await env.DB.batch([
     env.DB.prepare(
-      `UPDATE probe_results
-       SET usage_applied = 1
-       WHERE id IN (${placeholders}) AND usage_applied = 0`
-    ).bind(...ids),
-    env.DB.prepare(
       `INSERT INTO daily_usage (
         date, probe_results, worker_invocations, queue_messages, d1_writes, reserved_probes, updated_at
-      ) VALUES (?, changes(), 0, 0, changes() * 3, 0, ?)
+      ) SELECT substr(checked_at, 1, 10), COUNT(*), 0, 0, COUNT(*) * 3, 0, ?
+        FROM probe_results WHERE id IN (${placeholders}) AND usage_applied = 0
+        GROUP BY substr(checked_at, 1, 10)
       ON CONFLICT(date) DO UPDATE SET
         probe_results = probe_results + excluded.probe_results,
         d1_writes = d1_writes + excluded.d1_writes,
         updated_at = excluded.updated_at`
-    ).bind(resultDate, now)
+    ).bind(now, ...ids),
+    env.DB.prepare(
+      `UPDATE probe_results SET usage_applied = 1
+       WHERE id IN (${placeholders}) AND usage_applied = 0`
+    ).bind(...ids)
   ]);
 }
 
 async function writePendingAnalytics(env: RuntimeEnv, resultIds: string[]): Promise<void> {
-  const ids = [...new Set(resultIds)].slice(0, 5);
+  const ids = [...new Set(resultIds)].slice(0, RESULT_BATCH_LIMIT);
   if (ids.length === 0) return;
   const placeholders = ids.map(() => "?").join(", ");
   const pending = await env.DB.prepare(
@@ -760,12 +774,7 @@ async function writePendingAnalytics(env: RuntimeEnv, resultIds: string[]): Prom
   const results = (pending.results ?? []).map(mapProbeResult);
   writeAnalytics(env, results);
   if (results.length > 0) {
-    await env.DB.batch(
-      results.map((result) =>
-        env.DB.prepare("UPDATE probe_results SET analytics_applied = 1 WHERE id = ? AND analytics_applied = 0")
-          .bind(result.id)
-      )
-    );
+    await env.DB.prepare(`UPDATE probe_results SET analytics_applied = 1 WHERE id IN (${placeholders}) AND analytics_applied = 0`).bind(...ids).run();
   }
 }
 
@@ -779,7 +788,7 @@ export async function archiveProbeResults(env: RuntimeEnv, results: ProbeResult[
   );
   const date = archiveTime.toISOString().slice(0, 10);
   const hour = archiveTime.toISOString().slice(11, 13);
-  const identity = [...new Set(results.map((result) => result.id))].sort().join("\n");
+  const identity = [...new Set(results.map((result) => `${result.id}:${result.checkedAt}`))].sort().join("\n");
   const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(identity));
   const hash = [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
   const key = `probe-results/date=${date}/hour=${hour}/${hash}.json`;
@@ -807,7 +816,7 @@ export async function cleanupRetention(env: RuntimeEnv): Promise<void> {
   const days = parsePositiveInt(env.DEFAULT_RETENTION_DAYS, 30);
   const cutoff = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
   await env.DB.batch([
-    env.DB.prepare("DELETE FROM probe_results WHERE checked_at < ?").bind(cutoff),
+    env.DB.prepare("DELETE FROM probe_results WHERE id IN (SELECT id FROM probe_results WHERE checked_at < ? LIMIT 1000)").bind(cutoff),
     env.DB.prepare("DELETE FROM scheduler_runs WHERE started_at < ?").bind(cutoff),
     env.DB.prepare("DELETE FROM incidents WHERE status = 'resolved' AND opened_at < ?").bind(cutoff),
     env.DB.prepare("DELETE FROM daily_usage WHERE date < ?").bind(cutoff.slice(0, 10))
@@ -843,125 +852,76 @@ async function bumpDailyUsage(
 }
 
 async function updateIncidents(env: RuntimeEnv, monitorIds: string[]): Promise<void> {
-  for (const monitorId of monitorIds) {
-    const [monitor, regionCount] = await Promise.all([
-      env.DB.prepare("SELECT daily_budget, enabled FROM monitors WHERE id = ?")
-        .bind(monitorId)
-        .first<{ daily_budget: number; enabled: number }>(),
-      env.DB.prepare("SELECT COUNT(*) AS count FROM regions WHERE enabled = 1").first<{ count: number }>()
-    ]);
-    if (!monitor) continue;
-    const expectedRegionalIntervalMs =
-      (86_400_000 * Math.max(1, regionCount?.count ?? 1)) / Math.max(1, monitor.daily_budget);
-    const staleAfterMs = Math.min(7 * 86_400_000, Math.max(2 * 60 * 60_000, expectedRegionalIntervalMs * 3));
-    const freshnessCutoff = new Date(Date.now() - staleAfterMs).toISOString();
-    const expiresAt = new Date(Date.now() + staleAfterMs).toISOString();
-    const failing = monitor.enabled
-      ? await env.DB.prepare(
-      `SELECT COUNT(*) AS count
-       FROM monitor_latest AS latest
-       INNER JOIN regions AS region ON region.id = latest.region_id AND region.enabled = 1
-       WHERE latest.monitor_id = ? AND latest.ok = 0 AND latest.checked_at >= ?`
-        )
-          .bind(monitorId, freshnessCutoff)
-          .first<{ count: number }>()
-      : null;
-    const failingRegions = failing?.count ?? 0;
-    const openIncident = await env.DB.prepare(
-      "SELECT * FROM incidents WHERE monitor_id = ? AND status = 'open' ORDER BY opened_at DESC LIMIT 1"
-    )
-      .bind(monitorId)
-      .first<DbRow>();
-
-    if (failingRegions > 0 && !openIncident) {
-      await env.DB.prepare(
-        `INSERT OR IGNORE INTO incidents (
-          id, monitor_id, opened_at, severity, status, failing_regions, summary, expires_at
-        ) VALUES (?, ?, ?, ?, 'open', ?, ?, ?)`
+  if (!monitorIds.length) return;
+  const [monitors, regions] = await Promise.all([listMonitors(env), listRegions(env)]);
+  const effective = applyGlobalDailyCap(monitors, parsePositiveInt(env.MAX_DAILY_PROBES, 10_000));
+  const active = regions.filter((region) => region.enabled);
+  const totalWeight = active.reduce((sum, region) => sum + region.weight, 0);
+  const now = nowIso();
+  const ids = JSON.stringify([...new Set(monitorIds)]);
+  const policies = JSON.stringify(effective.filter((monitor) => monitor.enabled && monitorIds.includes(monitor.id)).flatMap((monitor) =>
+    active.map((region) => {
+      const freshnessMs = regionalFreshnessMs(monitor.dailyBudget, totalWeight, region.weight);
+      return { monitorId: monitor.id, regionId: region.id, freshnessMs,
+        cutoff: new Date(Date.parse(now) - freshnessMs).toISOString() };
+    })
+  ));
+  // Re-evaluate latest evidence inside each statement of one transaction. This
+  // prevents two consumers from applying stale read/modify/write incident state.
+  const evidence = `WITH policies AS (
+    SELECT json_extract(value, '$.monitorId') AS monitor_id,
+      json_extract(value, '$.regionId') AS region_id,
+      json_extract(value, '$.cutoff') AS cutoff,
+      json_extract(value, '$.freshnessMs') AS freshness_ms FROM json_each(?)
+  ), evidence AS (
+    SELECT requested.value AS monitor_id, COUNT(policy.region_id) AS expected,
+      SUM(CASE WHEN latest.result_type = 'target' AND latest.ok = 0 AND latest.checked_at >= policy.cutoff THEN 1 ELSE 0 END) AS failures,
+      SUM(CASE WHEN latest.result_type = 'target' AND latest.ok = 1 AND latest.checked_at >= policy.cutoff THEN 1 ELSE 0 END) AS passes,
+      MIN(CASE WHEN latest.result_type = 'target' AND latest.ok = 0 AND latest.checked_at >= policy.cutoff
+        THEN strftime('%Y-%m-%dT%H:%M:%fZ', julianday(latest.checked_at) + policy.freshness_ms / 86400000.0) END) AS expiry
+    FROM json_each(?) AS requested
+    LEFT JOIN policies AS policy ON policy.monitor_id = requested.value
+    LEFT JOIN monitor_latest AS latest ON latest.monitor_id = policy.monitor_id AND latest.region_id = policy.region_id
+    GROUP BY requested.value
+  )`;
+  await env.DB.batch([
+    env.DB.prepare(evidence + `
+      INSERT INTO incidents (id, monitor_id, opened_at, severity, status, failing_regions, summary, expires_at)
+      SELECT 'inc_' || lower(hex(randomblob(16))), monitor_id, ?,
+        CASE WHEN failures = expected THEN 'outage' ELSE 'degraded' END,
+        'open', failures, failures || ' region(s) failing', expiry FROM evidence WHERE failures > 0
+      ON CONFLICT(monitor_id) WHERE status IN ('open', 'unknown') DO UPDATE SET
+        status = 'open', closed_at = NULL, failing_regions = excluded.failing_regions,
+        severity = excluded.severity, summary = excluded.summary, expires_at = excluded.expires_at
+    `).bind(policies, ids, now),
+    env.DB.prepare(evidence + `
+      UPDATE incidents SET status = 'resolved', closed_at = ?, failing_regions = 0,
+        summary = 'Recovery confirmed by fresh successful checks in all enabled regions', expires_at = NULL
+      WHERE status IN ('open', 'unknown') AND monitor_id IN (
+        SELECT monitor_id FROM evidence WHERE expected > 0 AND passes = expected
       )
-        .bind(
-          createId("inc"),
-          monitorId,
-          nowIso(),
-          failingRegions >= 3 ? "outage" : "degraded",
-          failingRegions,
-          `${failingRegions} region${failingRegions === 1 ? "" : "s"} failing`,
-          expiresAt
-        )
-        .run();
-    } else if (failingRegions === 0 && openIncident) {
-      await env.DB.prepare(
-        "UPDATE incidents SET status = 'resolved', closed_at = ? WHERE id = ?"
+    `).bind(policies, ids, now),
+    env.DB.prepare(evidence + `
+      UPDATE incidents SET status = 'unknown', closed_at = NULL, failing_regions = 0,
+        summary = 'Recovery unconfirmed: regional evidence is missing, stale, or unavailable', expires_at = NULL
+      WHERE status IN ('open', 'unknown') AND monitor_id IN (
+        SELECT monitor_id FROM evidence WHERE failures = 0 AND (expected = 0 OR passes < expected)
       )
-        .bind(nowIso(), textField(openIncident, "id"))
-        .run();
-    } else if (failingRegions > 0 && openIncident) {
-      await env.DB.prepare(
-        `UPDATE incidents SET
-          failing_regions = ?,
-          severity = ?,
-          summary = ?,
-          expires_at = ?
-        WHERE id = ?`
-      )
-        .bind(
-          failingRegions,
-          failingRegions >= 3 ? "outage" : "degraded",
-          `${failingRegions} region${failingRegions === 1 ? "" : "s"} failing`,
-          expiresAt,
-          textField(openIncident, "id")
-        )
-        .run();
-    }
-  }
+    `).bind(policies, ids)
+  ]);
 }
 
 export async function expireStaleIncidents(env: RuntimeEnv): Promise<void> {
-  const now = nowIso();
-  await env.DB.prepare(
-    `UPDATE incidents
-     SET
-       status = 'resolved',
-       closed_at = ?,
-       summary = 'Resolved after probe results became stale'
-     WHERE status = 'open' AND expires_at IS NOT NULL AND expires_at <= ?`
-  )
-    .bind(now, now)
-    .run();
+  const expired = await env.DB.prepare(
+    "SELECT monitor_id FROM incidents WHERE status = 'open' AND expires_at <= ?"
+  ).bind(nowIso()).all<{ monitor_id: string }>();
+  await updateIncidents(env, (expired.results ?? []).map((row) => row.monitor_id));
 }
 
 async function reconcileIncidentsAfterRegionChange(env: RuntimeEnv): Promise<void> {
-  const now = nowIso();
-  await env.DB.batch([
-    env.DB.prepare(
-      `WITH failure_counts AS (
-         SELECT latest.monitor_id, COUNT(*) AS count
-         FROM monitor_latest AS latest
-         INNER JOIN regions AS region ON region.id = latest.region_id AND region.enabled = 1
-         WHERE latest.ok = 0
-         GROUP BY latest.monitor_id
-       )
-       UPDATE incidents
-       SET
-         failing_regions = COALESCE((SELECT count FROM failure_counts WHERE monitor_id = incidents.monitor_id), 0),
-         severity = CASE
-           WHEN COALESCE((SELECT count FROM failure_counts WHERE monitor_id = incidents.monitor_id), 0) >= 3
-             THEN 'outage'
-           ELSE 'degraded'
-         END,
-         summary = COALESCE((SELECT count FROM failure_counts WHERE monitor_id = incidents.monitor_id), 0)
-           || ' region(s) failing after region configuration changed'
-       WHERE status = 'open'`
-    ),
-    env.DB.prepare(
-      `UPDATE incidents
-       SET
-         status = 'resolved',
-         closed_at = ?,
-         summary = 'Resolved after region configuration changed'
-       WHERE status = 'open' AND failing_regions = 0`
-    ).bind(now)
-  ]);
+  const incidents = await env.DB.prepare("SELECT monitor_id FROM incidents WHERE status IN ('open', 'unknown')")
+    .all<{ monitor_id: string }>();
+  await updateIncidents(env, (incidents.results ?? []).map((row) => row.monitor_id));
 }
 
 function writeAnalytics(env: RuntimeEnv, results: ProbeResult[]): void {
@@ -976,7 +936,7 @@ function writeAnalytics(env: RuntimeEnv, results: ProbeResult[]): void {
         result.entryColo ?? "",
         result.placement ?? ""
       ],
-      doubles: [result.latencyMs ?? -1, result.status ?? 0, result.ok ? 1 : 0, result.responseBytes],
+      doubles: [result.latencyMs ?? -1, result.status ?? 0, result.resultType === "infrastructure" ? -1 : result.ok ? 1 : 0, result.responseBytes],
       indexes: [result.monitorId]
     });
   }
@@ -1031,6 +991,7 @@ function mapLatest(row: DbRow): LatestResult {
     resultId: textField(row, "result_id"),
     checkedAt: textField(row, "checked_at"),
     ok: boolFromDb(row.ok),
+    resultType: row.result_type === "infrastructure" ? "infrastructure" : "target",
     status: nullableNumber(row.status),
     latencyMs: nullableNumber(row.latency_ms),
     error: nullableTextField(row, "error"),
@@ -1049,6 +1010,7 @@ function mapProbeResult(row: DbRow): ProbeResult {
     targetUrl: textField(row, "target_url"),
     checkedAt: textField(row, "checked_at"),
     ok: boolFromDb(row.ok),
+    resultType: row.result_type === "infrastructure" ? "infrastructure" : "target",
     status: nullableNumber(row.status),
     latencyMs: nullableNumber(row.latency_ms),
     error: nullableTextField(row, "error"),

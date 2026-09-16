@@ -2,14 +2,16 @@ import { describe, expect, it } from "vitest";
 import { estimateCost } from "../src/cost";
 
 describe("cost estimate", () => {
-  it("keeps 10 URLs / 10,000 total probes per day in free quotas when batched", () => {
-    const estimate = estimateCost({ urlCount: 10, probesPerDay: 10_000, queueBatchSize: 5 });
+  it("simulates per-monitor minute quotas and does not promise free D1 writes", () => {
+    const estimate = estimateCost({ urlCount: 10, probesPerDay: 10_000, queueBatchSize: 10 });
     expect(estimate.probesPerMonth).toBe(300_000);
     expect(estimate.averageProbesPerUrlPerDay).toBe(1_000);
-    expect(estimate.queueOperationsPerDay).toBe(8_640);
-    expect(estimate.workerRequestsPerDayWorstCase).toBe(14_320);
+    expect(estimate.queueOperationsPerDay).toBe(3_000);
+    expect(estimate.workerRequestsPerDayWorstCase).toBe(12_440);
     expect(estimate.d1RowsWrittenPerDay).toBe(30_000);
-    expect(estimate.recommendedPlan).toBe("free");
+    expect(estimate.recommendedPlan).toBe("verify-d1");
+    expect(estimate.fitsD1FreeWrites).toBeNull();
+    expect(estimateCost({urlCount:10, probesPerDay:10000, queueBatchSize:5}).queueOperationsPerDay).toBe(6000);
   });
 
   it("recommends paid when worst-case worker requests exceed the free daily quota", () => {

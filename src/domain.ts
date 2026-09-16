@@ -1,4 +1,6 @@
 export type MonitorMethod = "HEAD" | "GET";
+export type ResultType = "target" | "infrastructure";
+export const RESULT_BATCH_LIMIT = 10;
 
 export interface MonitorConfig {
   id: string;
@@ -48,6 +50,7 @@ export interface RegionSeed {
 }
 
 export interface ProbeJob {
+  jobId?: string;
   runId: string;
   scheduledAt: string;
   monitor: Pick<
@@ -66,6 +69,7 @@ export interface ProbeJob {
 }
 
 export interface ProbeResult {
+  resultType?: ResultType;
   id: string;
   runId: string;
   monitorId: string;
@@ -99,6 +103,7 @@ export interface Summary {
 }
 
 export interface LatestResult {
+  resultType?: ResultType;
   monitorId: string;
   regionId: string;
   resultId: string;
@@ -143,6 +148,7 @@ export interface SchedulerRun {
 }
 
 export interface RunStatus extends SchedulerRun {
+  unknownResults: number;
   storedResults: number;
   successfulResults: number;
   failedResults: number;

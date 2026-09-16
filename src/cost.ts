@@ -1,8 +1,12 @@
+import { quotaForMinute } from "./scheduler";
+import { RESULT_BATCH_LIMIT } from "./domain";
+
 export interface CostEstimateInput {
   urlCount: number;
   probesPerDay: number;
   queueBatchSize: number;
   daysPerMonth?: number;
+  monitorBudgets?: number[];
 }
 
 export interface CostEstimate {
@@ -20,25 +24,31 @@ export interface CostEstimate {
   fitsWorkersFree: boolean;
   fitsQueuesFree: boolean;
   fitsAnalyticsFree: boolean;
-  fitsD1FreeWrites: boolean;
-  recommendedPlan: "free" | "workers-paid";
+  fitsD1FreeWrites: null;
+  recommendedPlan: "verify-d1" | "workers-paid";
+  assumptions: string[];
 }
 
 const WORKERS_FREE_REQUESTS_PER_DAY = 100_000;
 const QUEUES_FREE_OPS_PER_DAY = 10_000;
 const ANALYTICS_FREE_POINTS_PER_DAY = 100_000;
-const D1_FREE_WRITES_PER_DAY = 100_000;
 
 export function estimateCost(input: CostEstimateInput): CostEstimate {
-  const probesPerDay = nonNegativeInteger(input.probesPerDay, 0);
-  const urlCount = positiveInteger(input.urlCount, 1);
-  const queueBatchSize = positiveInteger(input.queueBatchSize, 1);
+  const urlCount = Math.min(1000, positiveInteger(input.urlCount, 1));
+  const requested = Math.min(10_000_000, nonNegativeInteger(input.probesPerDay, 0));
+  const budgets = input.monitorBudgets?.slice(0, 1000).map((value) => Math.min(10_000_000, nonNegativeInteger(value, 0)))
+    ?? Array.from({ length: urlCount }, (_, i) => Math.floor(requested / urlCount) + (i < requested % urlCount ? 1 : 0));
+  const probesPerDay = budgets.reduce((sum, budget) => sum + budget, 0);
+  const queueBatchSize = Math.min(RESULT_BATCH_LIMIT, positiveInteger(input.queueBatchSize, 1));
   const days = positiveInteger(input.daysPerMonth ?? 30, 30);
-  const activeMinutesPerDay = Math.min(1_440, probesPerDay);
-  const queueMessagesPerDay =
-    activeMinutesPerDay === 0
-      ? 0
-      : activeMinutesPerDay * Math.ceil(probesPerDay / activeMinutesPerDay / queueBatchSize);
+  const budgetCounts = new Map<number, number>();
+  for (const budget of budgets) budgetCounts.set(budget, (budgetCounts.get(budget) ?? 0) + 1);
+  let queueMessagesPerDay = 0;
+  for (let minute = 0; minute < 1440; minute++) {
+    let count = 0;
+    for (const [budget, multiplicity] of budgetCounts) count += quotaForMinute(budget, minute) * multiplicity;
+    queueMessagesPerDay += Math.ceil(count / queueBatchSize);
+  }
   const queueOperationsPerDay = queueMessagesPerDay * 3;
   const controlCronInvocationsPerDay = 1_440;
   const queueConsumerInvocationsPerDay = queueMessagesPerDay;
@@ -50,7 +60,7 @@ export function estimateCost(input: CostEstimateInput): CostEstimate {
   const fitsQueuesFree = queueOperationsPerDay <= QUEUES_FREE_OPS_PER_DAY;
   const fitsAnalyticsFree = probesPerDay <= ANALYTICS_FREE_POINTS_PER_DAY;
   const d1RowsWrittenPerDay = probesPerDay * 3;
-  const fitsD1FreeWrites = d1RowsWrittenPerDay <= D1_FREE_WRITES_PER_DAY;
+  const fitsD1FreeWrites = null;
 
   return {
     urlCount,
@@ -69,7 +79,13 @@ export function estimateCost(input: CostEstimateInput): CostEstimate {
     fitsAnalyticsFree,
     fitsD1FreeWrites,
     recommendedPlan:
-      fitsWorkersFree && fitsQueuesFree && fitsAnalyticsFree && fitsD1FreeWrites ? "free" : "workers-paid"
+      fitsWorkersFree && fitsQueuesFree && fitsAnalyticsFree ? "verify-d1" : "workers-paid",
+    assumptions: [
+      input.monitorBudgets ? "Configured effective monitor budgets." : "Budget split evenly across URLs.",
+      "All UTC-minute triggers delivered; excludes manual runs, retries and DLQ traffic.",
+      "Queue messages under 64 KB; larger messages use additional billing units.",
+      "D1 value is a logical row baseline, excluding indexes, acknowledgements, incidents and scheduling. Verify metered writes in Cloudflare."
+    ]
   };
 }
 

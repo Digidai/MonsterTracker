@@ -11,7 +11,7 @@ Use Workers as both the control plane and probe runtime. Do not use Cloudflare H
 - D1: monitors, regions, latest results, raw results, incidents, daily usage.
 - Queues: batches probe results so high-frequency schedules do not synchronously write many D1 rows.
 - Analytics Engine: query-friendly time-series points.
-- R2: raw JSON archives for replay and export.
+- R2: raw JSON archives for export. Automatic archive replay is not implemented.
 
 ## Region Strategy
 
@@ -32,7 +32,7 @@ Region selection rotates deterministically by monitor id and date. Region weight
 
 - No Health Checks dependency: meets project constraint.
 - No third-party backend: all runtime services are Cloudflare products.
-- Free-tier viable for `10 URLs / 10,000 total probes/day` with 5-result Queue batches, though Queue operations are close enough to the daily limit to require monitoring.
+- For `10 URLs / 10,000 total probes/day`, ten-result messages reduce Queue usage to about 3,000 operations/day. D1 metered writes must be measured before promising a free deployment.
 - High-scale mode requires Workers Paid mainly for Worker count, Cron limits, and operational headroom.
 - Extended region packs can exceed the Free subrequest limit because the scheduler calls one probe Worker per active region in a single invocation.
 - Control-to-probe dispatch over workers.dev requires `global_fetch_strictly_public`; otherwise Cloudflare returns Worker error `1042` for same-zone Worker fetches. Service Bindings should be evaluated once the deployment target can tolerate static bindings for every probe Worker.
@@ -44,14 +44,15 @@ Region selection rotates deterministically by monitor id and date. Region weight
 - Scheduler run records should be kept lightweight and bounded in the dashboard because D1 remains the source of truth for config/latest data, not a high-volume event store.
 - Probe and dispatch concurrency are capped at six to match the Workers simultaneous outgoing connection limit.
 - Internal probe payloads are bounded and revalidated at the probe Worker, so the shared-secret endpoint cannot bypass target URL policy.
-- Probe Worker responses are size-bounded and reconciled one-for-one with dispatched jobs; missing or malformed results become explicit failure records.
+- Probe Worker responses are size-bounded and reconciled one-for-one with dispatched jobs; missing or malformed results become infrastructure records, never target outages.
 - Queue consumers are idempotent because raw result ids use conflict-ignore semantics, usage counters advance only for newly accepted results, and stale deliveries cannot overwrite newer latest state.
 - Incident evaluation ignores region results after a schedule-aware freshness window, while resolved incident and raw result history follow the configured retention period.
-- Queue messages are capped at five results and consumed one message per invocation so D1 Free query limits remain bounded. Failed messages move to a dedicated dead-letter queue.
+- Queue messages are capped at ten results and consumed one message per invocation so D1 Free query limits remain bounded. Failed messages move to a dedicated dead-letter queue.
 - Result usage and Analytics Engine delivery use per-result effect markers. Queue retries can complete interrupted side effects without double-counting accepted raw rows.
 - Every dispatched job carries a monitor configuration version. Results from a disabled or superseded configuration are rejected by conditional D1 writes.
 - Probe budget is atomically reserved before dispatch, and scheduled run ids are deterministic per UTC minute to prevent duplicate Cron work.
 - Scheduled jobs are persisted with a 16-minute execution lease aligned with the Worker execution ceiling. A later Cron trigger reclaims an unfinished expired run, so termination after budget reservation does not lose the minute or overlap a still-running invocation.
+- Recovery is limited to three attempts. `MAX_DAILY_PROBES` bounds reservations for new logical checks; recovery can repeat outbound requests without reserving the same jobs again. Cost estimates exclude these additional attempts. Result IDs remain deterministic, so stored observations and usage effects are not duplicated.
 - Regional dispatch accepts only the configured account Worker hostname suffix and does not follow redirects with the shared secret.
-- R2 object keys are derived from result ids, making archive retries overwrite the same object instead of duplicating exports.
-- Open incidents carry a schedule-aware expiry and are closed by the minute Cron even when probes stop producing new results.
+- R2 object keys are derived from result ids, and observation timestamps, so duplicate deliveries reuse an object while a recovered probe attempt preserves its distinct evidence.
+- Open incidents carry a weighted, effective-budget freshness window. Stale or unavailable evidence changes an incident to unknown; only fresh successful evidence from all enabled regions confirms recovery. Config changes explicitly close superseded incidents.

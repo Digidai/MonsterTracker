@@ -1,44 +1,22 @@
-# Cost Model
+# Cost model
 
-## Formula
+The estimator simulates all 1,440 UTC minutes for each monitor's effective budget. It sums each minute's results and rounds up messages at the configured batch size. The API assumes an even split; Usage uses actual budgets after the global cap.
 
-```text
-probes_per_day = sum(monitor.daily_budget)
-probes_per_month = probes_per_day * 30
-active_minutes = min(1440, probes_per_day)
-queue_messages_per_day = active_minutes
-                       * ceil(probes_per_day / active_minutes / queue_batch_size)
-queue_ops_per_day = queue_messages_per_day * 3
-conservative_worker_invocations = probes_per_day
-                                + 1440 cron invocations
-                                + queue_messages_per_day queue consumers
-```
-
-The `* 3` queue estimate covers produce, consume, and delete operations.
-
-## Example: 10 URLs / 10,000 Total Probes Per Day
-
-Assume each URL has `daily_budget = 1000`.
+For 10 monitors with 1,000 probes each per day:
 
 ```text
-10 monitors * 1000 probes/day = 10,000 probes/day
-10,000 probes/day * 30 = 300,000 probes/month
-1,440 active minutes * ceil((10,000 / 1,440) / 5) * 3 = 8,640 queue ops/day
-10,000 + 1,440 + 2,880 = 14,320 conservative Worker invocations/day
-10,000 * 3 = 30,000 D1 writes/day before index overhead
+1,000 active minutes × 10 results = 10,000 probes/day
+1,000 × ceil(10 / 10) = 1,000 messages/day
+1,000 × 3 = 3,000 Queue operations/day (baseline)
+10,000 + 1,440 Cron + 1,000 consumers = 12,440 Worker invocations/day (upper estimate)
 ```
 
-Expected bill: `$0/month` on Free for this workload with the default 5-result Queue batch, but Queue operations have limited headroom. The estimate reflects the fact that messages are flushed independently by minute rather than pooled across the day. The conservative Worker estimate assumes every probe is a separate placed Worker invocation; regional batching can make actual invocations lower. Incident, usage, scheduler, retention, and index maintenance add D1 work beyond the three primary result statements.
+The previous 5-result policy uses 6,000 operations for these budgets. The older 8,640 estimate ignored per-monitor minute alignment.
 
-## Upgrade Thresholds
+Queue billing uses 64 KB units including metadata. Normal delivery uses write/read/delete; retries and DLQ add operations. Manual samples consume the global probe cap and add messages. Examples assume every trigger runs and messages stay below 64 KB. [Queues pricing](https://developers.cloudflare.com/queues/platform/pricing/)
 
-Use Workers Paid when:
+D1 counters are logical primary row writes, not metered billing. Indexes, acknowledgements, usage markers, incidents, scheduling and retention add writes. `fitsD1FreeWrites` is null and the estimator recommends `verify-d1` when other modeled limits fit. Verify Cloudflare Metrics before promising a free deployment. [D1 pricing](https://developers.cloudflare.com/d1/platform/pricing/)
 
-- You need more than 100 Workers in an account.
-- You need more than 5 Cron triggers.
-- A scheduler tick needs to call more than 50 regional probe Workers.
-- Worst-case Worker requests approach 100,000/day.
-- You want operational headroom for dashboard/API usage.
-- You enable large extended/max region packs.
+The ten-result consumer executes 39 persistence statements plus one usage statement, including ten distinct monitors and incident creation. SQLite tests enforce this against the Free limit of 50 queries per invocation. Batching reduces round trips, not billable rows. [D1 limits](https://developers.cloudflare.com/d1/platform/limits/)
 
-Workers Paid is currently `$5/month` plus usage above included limits. Verify current pricing before publishing exact numbers.
+Static assets bypass the control script; only API, internal probe and health routes run it first. History loads on demand. Raw-row retention runs hourly with bounded deletes. Account quotas are shared with other applications.
