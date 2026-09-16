@@ -76,6 +76,12 @@ export interface RecordSchedulerRunInput {
   skippedJobs: number;
   error?: string | null;
   cancelledResultIds?: string[];
+  cancellations?: SchedulerCancellation[];
+}
+
+export interface SchedulerCancellation {
+  resultId: string;
+  reason: string;
 }
 
 export async function bootstrapDefaults(env: RuntimeEnv): Promise<void> {
@@ -366,6 +372,31 @@ export async function listRegions(env: RuntimeEnv): Promise<RegionConfig[]> {
   return (result.results ?? []).map(mapRegion);
 }
 
+export async function getSchedulingSnapshot(env: RuntimeEnv): Promise<{ monitors: MonitorConfig[]; regions: RegionConfig[] }> {
+  // Static column lists keep the existing row mappers and ordering while reading
+  // both tables in one consistent statement within the recovery query budget.
+  const monitorColumns = ["id", "name", "url", "method", "expected_status_min", "expected_status_max",
+    "body_match", "timeout_ms", "daily_budget", "enabled", "config_version", "tags_json", "created_at", "updated_at"];
+  const regionColumns = ["id", "label", "area", "provider", "provider_region", "placement_region", "worker_name",
+    "worker_url", "tier", "enabled", "weight", "last_seen_colo", "last_seen_country", "last_seen_placement",
+    "last_seen_at", "created_at", "updated_at"];
+  const jsonRow = (columns: string[]) => `json_object(${columns.map((column) => `'${column}', ${column}`).join(", ")})`;
+  const rows = await env.DB.prepare(`
+    SELECT 'monitor' AS kind, ${jsonRow(monitorColumns)} AS config_json,
+      created_at AS monitor_order, NULL AS enabled_order, NULL AS area_order, NULL AS label_order
+    FROM monitors WHERE deleted_at IS NULL
+    UNION ALL
+    SELECT 'region', ${jsonRow(regionColumns)}, NULL, enabled, area, label FROM regions
+    ORDER BY kind, monitor_order DESC, enabled_order DESC, area_order, label_order`
+  ).all<{ kind: "monitor" | "region"; config_json: string }>();
+  // Keep one object per row instead of aggregating the whole configuration into
+  // a single D1 value; monitors may carry large body-match expressions.
+  return {
+    monitors: (rows.results ?? []).filter((row) => row.kind === "monitor").map((row) => mapMonitor(JSON.parse(row.config_json) as DbRow)),
+    regions: (rows.results ?? []).filter((row) => row.kind === "region").map((row) => mapRegion(JSON.parse(row.config_json) as DbRow))
+  };
+}
+
 export async function listLatest(env: RuntimeEnv): Promise<LatestResult[]> {
   const result = await env.DB.prepare(
     `SELECT latest.* FROM monitor_latest AS latest
@@ -415,34 +446,43 @@ export async function listSchedulerRuns(env: RuntimeEnv, limit = 25): Promise<Sc
   return (result.results ?? []).map(mapSchedulerRun);
 }
 
-export async function getRunStatus(env: RuntimeEnv, id: string): Promise<RunStatus | null> {
+export async function getRunStatus(env: RuntimeEnv, id: string): Promise<(RunStatus & { cancellations: SchedulerCancellation[] }) | null> {
   const runRow = await env.DB.prepare("SELECT * FROM scheduler_runs WHERE id = ?").bind(id).first<DbRow>();
   if (!runRow) return null;
+  const cancellations = parseSchedulerCancellations(textField(runRow, "cancelled_result_ids_json") || "[]");
   const counts = await env.DB.prepare(
     `SELECT
        COUNT(*) AS stored_results,
        SUM(CASE WHEN ok = 1 THEN 1 ELSE 0 END) AS successful_results,
        SUM(CASE WHEN ok = 0 AND result_type = 'target' THEN 1 ELSE 0 END) AS failed_results,
        SUM(CASE WHEN result_type = 'infrastructure' THEN 1 ELSE 0 END) AS unknown_results,
-       (SELECT COUNT(*) FROM json_each(?) AS cancelled
-        WHERE NOT EXISTS (SELECT 1 FROM probe_results AS received WHERE received.id = cancelled.value)) AS cancelled_results
+       (SELECT json_group_array(cancelled.value) FROM json_each(?) AS cancelled
+        WHERE NOT EXISTS (SELECT 1 FROM probe_results AS received WHERE received.id = cancelled.value)) AS cancelled_result_ids
      FROM probe_results
      WHERE run_id = ?`
   )
-    .bind(textField(runRow, "cancelled_result_ids_json") || "[]", id)
+    .bind(JSON.stringify(cancellations.map((item) => item.resultId)), id)
     .first<DbRow>();
   const run = mapSchedulerRun(runRow);
   const storedResults = numberField(counts ?? {}, "stored_results");
-  const cancelledResults = numberField(counts ?? {}, "cancelled_results");
+  const cancelledIds = new Set<string>(JSON.parse(textField(counts ?? {}, "cancelled_result_ids", "[]")));
+  const cancelledResults = cancelledIds.size;
   return {
     ...run,
     storedResults,
     cancelledResults,
+    cancellations: cancellations.filter((item) => cancelledIds.has(item.resultId)),
     successfulResults: numberField(counts ?? {}, "successful_results"),
     failedResults: numberField(counts ?? {}, "failed_results"),
     unknownResults: numberField(counts ?? {}, "unknown_results"),
-    pendingResults: run.error && run.finishedAt ? 0 : Math.max(0, run.plannedJobs - storedResults - cancelledResults)
+    pendingResults: Math.max(0, run.plannedJobs - storedResults - cancelledResults)
   };
+}
+
+function parseSchedulerCancellations(value: string): SchedulerCancellation[] {
+  const entries = JSON.parse(value) as (string | SchedulerCancellation)[];
+  // Older runs only stored IDs. Keep their cancellation accounting intact.
+  return entries.map((entry) => typeof entry === "string" ? { resultId: entry, reason: "unspecified" } : entry);
 }
 
 export async function getUsageSummary(env: RuntimeEnv): Promise<UsageSummary> {
@@ -520,17 +560,27 @@ export async function recordSchedulerRun(env: RuntimeEnv, input: RecordScheduler
       input.dispatchedJobs,
       input.skippedJobs,
       input.error ?? null,
-      input.cancelledResultIds ? JSON.stringify(input.cancelledResultIds) : null
+      input.cancellations ? JSON.stringify(input.cancellations)
+        : input.cancelledResultIds ? JSON.stringify(input.cancelledResultIds) : null
     )
     .run();
 }
 
-export async function retryScheduledRun(env: RuntimeEnv, id: string, error: string): Promise<void> {
+export async function retryScheduledRun(
+  env: RuntimeEnv,
+  id: string,
+  error: string,
+  cancellations?: SchedulerCancellation[]
+): Promise<void> {
   const now = nowIso();
+  // Cancellation is independent of result delivery. Persist it atomically with
+  // retry/terminal state without spending another invocation query.
   await env.DB.prepare(`UPDATE scheduler_runs SET error = ?,
     finished_at = CASE WHEN attempt_count >= 3 THEN ? ELSE NULL END,
-    lease_expires_at = CASE WHEN attempt_count >= 3 THEN NULL ELSE ? END
-    WHERE id = ? AND finished_at IS NULL`).bind(error.slice(0, 512), now, new Date(Date.now() + 60_000).toISOString(), id).run();
+    lease_expires_at = CASE WHEN attempt_count >= 3 THEN NULL ELSE ? END,
+    cancelled_result_ids_json = COALESCE(?, cancelled_result_ids_json)
+    WHERE id = ? AND finished_at IS NULL`).bind(error.slice(0, 512), now,
+      new Date(Date.now() + 60_000).toISOString(), cancellations ? JSON.stringify(cancellations) : null, id).run();
 }
 
 export async function claimScheduledRunAndReserve(
@@ -848,7 +898,7 @@ export async function cleanupRetention(env: RuntimeEnv): Promise<void> {
   await env.DB.batch([
     env.DB.prepare("DELETE FROM probe_results WHERE id IN (SELECT id FROM probe_results WHERE checked_at < ? LIMIT 1000)").bind(cutoff),
     env.DB.prepare("DELETE FROM scheduler_runs WHERE started_at < ?").bind(cutoff),
-    env.DB.prepare("DELETE FROM incidents WHERE status = 'resolved' AND opened_at < ?").bind(cutoff),
+    env.DB.prepare("DELETE FROM incidents WHERE status = 'resolved' AND COALESCE(closed_at, opened_at) < ?").bind(cutoff),
     env.DB.prepare("DELETE FROM daily_usage WHERE date < ?").bind(cutoff.slice(0, 10))
   ]);
 }

@@ -205,7 +205,27 @@ describe("no-Queue invocation preflight", () => {
     await scheduled(db.env);
     await Promise.all(background.splice(0));
     expect(db.sqlite.prepare("SELECT count(*) n FROM probe_results").get()?.n).toBe(8);
-    expect(db.count()).toBe(49);
+    expect(db.count()).toBe(50);
+    expect(db.sqlite.prepare("SELECT last_tick_at FROM operational_signals WHERE name='scheduler'").get()?.last_tick_at)
+      .toBe("2026-09-16T12:00:00.000Z");
+  });
+
+  it.each([9, 10])("counts the fifth-minute heartbeat before admitting %i direct jobs", async (count) => {
+    const db = setup(count); vi.setSystemTime("2026-09-16T12:05:00.000Z");
+    if (count === 9) {
+      await scheduled(db.env);
+      expect(db.count()).toBe(49);
+      expect(db.sqlite.prepare("SELECT COUNT(*) n FROM probe_results").get()?.n).toBe(9);
+      expect(db.sqlite.prepare("SELECT reserved_probes FROM daily_usage").get()?.reserved_probes).toBe(9);
+    } else {
+      await expect(scheduled(db.env)).rejects.toThrow("RESULTS_QUEUE is required");
+      expect(db.count()).toBe(7);
+      expect(fetch).not.toHaveBeenCalled();
+      expect(db.sqlite.prepare("SELECT COUNT(*) n FROM daily_usage").get()?.n).toBe(0);
+      expect(db.sqlite.prepare("SELECT COUNT(*) n FROM scheduler_runs").get()?.n).toBe(0);
+    }
+    expect(db.sqlite.prepare("SELECT last_tick_at FROM operational_signals WHERE name='scheduler'").get()?.last_tick_at)
+      .toBe("2026-09-16T12:05:00.000Z");
   });
 
   it("rejects aggregate recovery plus current work before claiming or dispatching either", async () => {

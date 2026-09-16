@@ -56,3 +56,8 @@ Region selection rotates deterministically by monitor id and date. Region weight
 - Regional dispatch accepts only the configured account Worker hostname suffix and does not follow redirects with the shared secret.
 - R2 object keys are derived from result ids, and observation timestamps, so duplicate deliveries reuse an object while a recovered probe attempt preserves its distinct evidence.
 - Open incidents carry a weighted, effective-budget freshness window. Stale or unavailable evidence changes an incident to unknown; only fresh successful evidence from all enabled regions confirms recovery. Config changes explicitly close superseded incidents.
+- Recovered jobs validate current enabled monitors, configuration versions and enabled regions, preserving cancelled result identities and reasons. Eligible jobs use current region routes. After recovery, a consistent monitor/region snapshot rebuilds the current minute plan.
+- Probe identity is bound to its configured `REGION_ID`. Production control Workers reject internal probe execution; explicit localhost development mode remains supported.
+- Authenticated `/api/diagnostics` separates observed cron heartbeats, actual D1 result persistence and Queue/DLQ backlog. Metrics are read on demand, with no additional Queue messages or automatic replay.
+- Authenticated monitor history uses current-config keyset pagination with insertion visibility pinned across pages. Retention may remove rows. Statistics distinguish unavailable probes from observed target failures; the pass rate is not time-weighted uptime.
+- Closed incident retention uses closure time. R2 lifecycle is independent of D1 retention and must be configured separately.

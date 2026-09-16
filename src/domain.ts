@@ -170,7 +170,7 @@ export interface RuntimeSettings {
 
 export type RuntimeEnv = Omit<
   Env,
-  "ROLE" | "REGION_PACK" | "DEFAULT_DAILY_PROBE_BUDGET" | "DEFAULT_RETENTION_DAYS" | "PROBE_BATCH_SIZE" | "ALLOW_LOCAL_PROBES"
+  "ROLE" | "REGION_PACK" | "DEFAULT_DAILY_PROBE_BUDGET" | "DEFAULT_RETENTION_DAYS" | "PROBE_BATCH_SIZE" | "ALLOW_LOCAL_PROBES" | "RESULTS_DLQ"
 > & {
   ASSETS?: { fetch: (request: Request) => Promise<Response> };
   ADMIN_TOKEN?: string;
@@ -196,6 +196,7 @@ export type RuntimeEnv = Omit<
   ALLOW_PRIVATE_TARGETS?: string;
   ALLOW_LOCAL_PROBES?: string;
   ARCHIVE_RAW_RESULTS?: string;
+  RESULTS_DLQ?: Queue;
 };
 
 export const DEFAULT_TIMEOUT_MS = 10_000;

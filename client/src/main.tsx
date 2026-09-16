@@ -44,6 +44,8 @@ import {
 } from "lucide-react";
 import {
   Component,
+  lazy,
+  Suspense,
   createContext,
   useContext,
   useCallback,
@@ -66,7 +68,6 @@ import type {
   MonitorConfigPatch,
   MonitorMethod,
   MonitorStatus,
-  ProbeResult,
   RegionConfig,
   RegionConfigPatch,
   RunStatus,
@@ -79,6 +80,10 @@ import type {
 import { applyGlobalDailyCap } from "../../src/budget";
 import { estimateCost } from "../../src/cost";
 import { monitorStatus, isRegionResultStale } from "../../src/health";
+import { downloadText, monitorBackup } from "./export";
+
+const MonitorHistory = lazy(() => import("./components/MonitorHistory"));
+const DiagnosticsPanel = lazy(() => import("./components/DiagnosticsPanel"));
 
 const DirtyContext = createContext<(key: string, dirty: boolean) => void>(() => {});
 const NavigateContext = createContext<(action: () => void) => void>((action) => action());
@@ -188,17 +193,13 @@ function App() {
   const [statusFilter, setStatusFilter] = useState<StatusFilter>("all");
   const [refreshing, setRefreshing] = useState(false);
   const [pendingAction, setPendingAction] = useState<string | null>(null);
-  const [history, setHistory] = useState<ProbeResult[]>([]);
-  const [historyLoading, setHistoryLoading] = useState(false);
-  const [historyError, setHistoryError] = useState<string | null>(null);
+  const [historyRefreshKey, setHistoryRefreshKey] = useState(0);
   const [toast, setToast] = useState<{ tone: "success" | "danger" | "info"; message: string } | null>(null);
   const [form, setForm] = useState<MonitorDraft>(defaultMonitorDraft);
   const [createError, setCreateError] = useState<string | null>(null);
   const summaryRequestId = useRef(0);
-  const historyRequestId = useRef(0);
   const tokenVerificationId = useRef(0);
   const summaryAbort = useRef<AbortController | null>(null);
-  const historyAbort = useRef<AbortController | null>(null);
   const dirtyDrafts = useRef(new Set<string>());
   const [leaveAction, setLeaveAction] = useState<{ execute: () => void } | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<MonitorConfig | null>(null);
@@ -260,19 +261,6 @@ function App() {
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [authStatus, token, pendingAction]);
-
-  useEffect(() => {
-    if (authStatus !== "authenticated" || !token.trim() || !selectedMonitorId || inspectorMode !== "detail" || detailTab !== "history") {
-      historyRequestId.current += 1;
-      historyAbort.current?.abort();
-      setHistory([]);
-      setHistoryError(null);
-      return;
-    }
-    void loadMonitorHistory(selectedMonitorId, token);
-    return () => { historyRequestId.current += 1; historyAbort.current?.abort(); };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [authStatus, selectedMonitorId, token, inspectorMode, detailTab]);
 
   useEffect(() => {
     if (!toast) return;
@@ -361,50 +349,20 @@ function App() {
     }
   }
 
-  async function loadMonitorHistory(monitorId: string, authToken = token) {
-    const requestId = historyRequestId.current + 1;
-    historyRequestId.current = requestId;
-    historyAbort.current?.abort();
-    historyAbort.current = new AbortController();
-    setHistoryLoading(true);
-    setHistory([]);
-    setHistoryError(null);
-    try {
-      const body = await requestJson<{ results: ProbeResult[] }>(
-        `/api/monitors/${encodeURIComponent(monitorId)}?limit=100`,
-        { signal: historyAbort.current.signal },
-        authToken
-      );
-      if (requestId === historyRequestId.current) setHistory(body.results);
-    } catch (error) {
-      if (requestId === historyRequestId.current) {
-        const message = error instanceof Error ? error.message : "Failed to load monitor history.";
-        setHistoryError(message);
-        showToast("danger", message);
-      }
-    } finally {
-      if (requestId === historyRequestId.current) setHistoryLoading(false);
-    }
-  }
-
   async function saveToken(nextToken: string) {
     const normalized = nextToken.trim();
     setPendingAction("token");
     try {
       if (!normalized) {
         summaryRequestId.current += 1;
-        historyRequestId.current += 1;
         tokenVerificationId.current += 1;
         summaryAbort.current?.abort();
-        historyAbort.current?.abort();
         sessionStorage.removeItem("monstertracker.adminToken");
         setToken("");
         setAuthStatus("locked");
         setSummary(null);
         setSummaryError(null);
         setSelectedMonitorId(null);
-        setHistory([]);
-        setHistoryError(null);
         setInspectorMode("closed");
         setView("tokens");
         showToast("info", "Admin token cleared.");
@@ -478,14 +436,9 @@ function App() {
     setDeleteError(null);
     try {
       await requestJson(`/api/monitors/${encodeURIComponent(id)}`, { method: "DELETE" });
-      // A summary/history read started before deletion must not restore stale UI.
+      // A summary read started before deletion must not restore stale UI.
       summaryRequestId.current += 1;
       summaryAbort.current?.abort();
-      historyRequestId.current += 1;
-      historyAbort.current?.abort();
-      setHistory([]);
-      setHistoryError(null);
-      setHistoryLoading(false);
       reportDirty(`monitor:${id}`, false);
       setSummary((current) => current ? {
         ...current,
@@ -527,7 +480,7 @@ function App() {
         latest: current.latest.filter((item) => item.monitorId !== id)
       } : current);
       await loadSummary(token, false);
-      if (detailTab === "history") await loadMonitorHistory(id);
+      setHistoryRefreshKey((value) => value + 1);
       showToast("success", "Monitor configuration saved.");
     } catch (error) {
       showToast("danger", error instanceof Error ? error.message : "Monitor update failed.");
@@ -621,7 +574,7 @@ function App() {
       const run = await waitForRun(body.runId);
       showRunOutcome(run, body.successfulJobs, body.failedJobs, body.unknownJobs);
       await loadSummary(token, false);
-      if (detailTab === "history") await loadMonitorHistory(monitorId);
+      setHistoryRefreshKey((value) => value + 1);
     } catch (error) {
       setRunFeedback(error instanceof Error ? error.message : "Sample run failed.");
       showToast("danger", error instanceof Error ? error.message : "Sample run failed.");
@@ -637,13 +590,13 @@ function App() {
       const body = await requestJson<{ run: RunStatus }>(`/api/runs/${encodeURIComponent(runId)}`);
       latest = body.run;
       setRunFeedback(`${latest.storedResults} / ${latest.plannedJobs} regional results stored.`);
-      if (latest.pendingResults === 0) return latest;
+      if (latest.pendingResults === 0 || (latest.error && latest.finishedAt)) return latest;
     }
     return latest;
   }
 
   function showRunOutcome(run: RunStatus | null, immediateSuccesses: number, immediateFailures: number, immediateUnknown = 0) {
-    setPendingRunId(run && run.pendingResults > 0 ? run.id : null);
+    setPendingRunId(run && run.pendingResults > 0 && !(run.error && run.finishedAt) ? run.id : null);
     if (run?.error) {
       const message = run.error === "daily_probe_budget_exhausted" ? "The daily probe budget is exhausted. No new checks were started." : `Run incomplete: ${run.error}`;
       setRunFeedback(message);
@@ -655,7 +608,7 @@ function App() {
     const pending = run?.pendingResults ?? 0;
     const unknown = run?.unknownResults ?? immediateUnknown;
     const cancelled = run?.cancelledResults ?? 0;
-    setRunFeedback(`${successes} passed · ${failures} target failures · ${unknown} unavailable probes · ${pending} pending.${cancelled ? ` ${cancelled} skipped after monitor deletion.` : ""}${pending > 0 ? " Results are still arriving. Recheck for the latest status." : ""}`);
+    setRunFeedback(`${successes} passed · ${failures} target failures · ${unknown} unavailable probes · ${pending} pending.${cancelled ? ` ${cancelled} cancelled after configuration changes.` : ""}${pending > 0 ? " Results are still arriving. Recheck for the latest status." : ""}`);
     if (pending > 0) {
       showToast("info", `${successes + failures + unknown} results stored; ${pending} still pending.`);
     } else if (failures > 0) {
@@ -663,7 +616,7 @@ function App() {
     } else if (unknown > 0) {
       showToast("info", `${unknown} probes unavailable; target status is unconfirmed.`);
     } else if (cancelled > 0) {
-      showToast("info", `${successes} checks passed; ${cancelled} skipped after monitor deletion.`);
+      showToast("info", `${successes} checks passed; ${cancelled} cancelled after configuration changes.`);
     } else {
       showToast("success", `${successes} checks passed and were stored.`);
     }
@@ -769,6 +722,7 @@ function App() {
             monitors={filteredMonitors}
             selectedMonitorId={inspectorMode === "detail" ? selectedMonitorId : null}
             token={sessionReady ? token : ""}
+            onUnauthorized={() => setAuthStatus("error")}
             loading={actionLoading || !sessionReady}
             onTokenSave={saveToken}
             onRegionSave={saveRegionConfig}
@@ -788,9 +742,9 @@ function App() {
           summary={data}
           monitor={selectedMonitor}
           latest={selectedLatest}
-          history={history}
-          historyError={historyError}
-          historyLoading={historyLoading}
+          token={sessionReady ? token : ""}
+          historyRefreshKey={historyRefreshKey}
+          onUnauthorized={() => setAuthStatus("error")}
           mode={inspectorMode}
           tab={detailTab}
           form={form}
@@ -801,7 +755,6 @@ function App() {
           onMonitorSave={saveMonitorConfig}
           onMonitorRun={runMonitorSample}
           onMonitorDelete={(monitor) => { setDeleteError(null); setDeleteTarget(monitor); }}
-          onHistoryRetry={() => selectedMonitorId && loadMonitorHistory(selectedMonitorId)}
           onFormChange={(nextForm) => {
             setForm(nextForm);
             if (createError) setCreateError(null);
@@ -1215,6 +1168,7 @@ function MainView({
   monitors,
   selectedMonitorId,
   token,
+  onUnauthorized,
   loading,
   onTokenSave,
   onRegionSave,
@@ -1227,6 +1181,7 @@ function MainView({
   monitors: MonitorConfig[];
   selectedMonitorId: string | null;
   token: string;
+  onUnauthorized: () => void;
   loading: boolean;
   onTokenSave: (value: string) => void | Promise<void>;
   onRegionSave: (id: string, patch: RegionConfigPatch) => void | Promise<void>;
@@ -1252,7 +1207,7 @@ function MainView({
       />
     );
   }
-  if (view === "usage") return <UsageView summary={summary} health={health} />;
+  if (view === "usage") return <UsageView summary={summary} health={health} token={token} onUnauthorized={onUnauthorized} />;
   if (view === "tokens") {
     return <SettingsView summary={summary} tokenSet={Boolean(token.trim())} onTokenSave={onTokenSave} />;
   }
@@ -1591,7 +1546,7 @@ function IncidentsView({
   );
 }
 
-function UsageView({ summary, health }: { summary: Summary; health: HealthSummary }) {
+function UsageView({ summary, health, token, onUnauthorized }: { summary: Summary; health: HealthSummary; token: string; onUnauthorized: () => void }) {
   const estimate = estimateCost({ urlCount: summary.monitors.length, probesPerDay: 0,
     monitorBudgets: summary.monitors.filter((monitor) => monitor.enabled).map((monitor) => monitor.effectiveDailyBudget ?? monitor.dailyBudget),
     queueBatchSize: summary.runtime.resultQueueBatchSize });
@@ -1648,32 +1603,9 @@ function UsageView({ summary, health }: { summary: Summary; health: HealthSummar
           </div>
         </Card.Content>
       </Card>
-      <Card className="data-card" variant="default">
-        <Card.Header>
-          <div>
-            <Card.Title>Recent scheduler runs</Card.Title>
-            <Card.Description>Manual samples and cron runs persisted from the control Worker.</Card.Description>
-          </div>
-          <Chip size="sm" variant="soft">{summary.runs.length} runs</Chip>
-        </Card.Header>
-        <Card.Content className="run-list">
-          {summary.runs.length ? summary.runs.slice(0, 10).map((run) => (
-            <Surface className="run-row" key={run.id}>
-              <div>
-                <strong>{run.trigger === "manual" ? "Manual" : "Cron"} run</strong>
-                <span>{relativeTime(run.startedAt)} · {run.id}</span>
-              </div>
-              <Chip color={run.error || run.dispatchedJobs < run.plannedJobs ? "warning" : !run.finishedAt ? "default" : "success"} size="sm" variant="soft">
-                {run.error ? (run.finishedAt ? "failed" : "retrying") : !run.finishedAt ? "running" : run.dispatchedJobs < run.plannedJobs ? "incomplete dispatch" : run.plannedJobs === 0 ? "no work" : "dispatched"}
-              </Chip>
-              <span>{run.dispatchedJobs} / {run.plannedJobs} jobs</span>
-              <span>{run.error ? compactText(run.error, 48) : run.finishedAt ? `finished ${relativeTime(run.finishedAt)}` : `${run.skippedJobs} skipped`}</span>
-            </Surface>
-          )) : (
-            <div className="notice-panel">No scheduler runs recorded yet.</div>
-          )}
-        </Card.Content>
-      </Card>
+      <Suspense fallback={<div className="notice-panel">Loading delivery diagnostics…</div>}>
+        <DiagnosticsPanel token={token} onUnauthorized={onUnauthorized} />
+      </Suspense>
     </>
   );
 }
@@ -1950,6 +1882,16 @@ function SettingsView({
           <RuntimeItem label="Dispatch concurrency" value={summary.runtime.dispatchConcurrency} />
         </Card.Content>
       </Card>
+      <Card className="data-card" variant="default">
+        <Card.Header><div><Card.Title>Configuration backup</Card.Title>
+          <Card.Description>Download monitor settings as a versioned JSON file.</Card.Description></div></Card.Header>
+        <Card.Content className="settings-card-content">
+          <p className="panel-help">Includes targets, check rules, budgets, tags and enabled states from the current dashboard snapshot. Tokens, Worker bindings and probe history are excluded. Automatic restore is not available.</p>
+          <Button variant="secondary" isDisabled={!tokenSet || !summary.monitors.length} onPress={() => downloadText(
+            `monstertracker-monitors-${new Date().toISOString().slice(0, 10)}.json`,
+            JSON.stringify(monitorBackup(summary.monitors, summary.generatedAt), null, 2), "application/json")}>Export {summary.monitors.length} monitor configurations</Button>
+        </Card.Content>
+      </Card>
     </div>
   );
 }
@@ -1967,9 +1909,9 @@ function Inspector({
   summary,
   monitor,
   latest,
-  history,
-  historyError,
-  historyLoading,
+  token,
+  historyRefreshKey,
+  onUnauthorized,
   mode,
   tab,
   form,
@@ -1980,16 +1922,15 @@ function Inspector({
   onMonitorSave,
   onMonitorRun,
   onMonitorDelete,
-  onHistoryRetry,
   onFormChange,
   onCreate
 }: {
   summary: Summary;
   monitor: MonitorConfig | null;
   latest: LatestResult[];
-  history: ProbeResult[];
-  historyError: string | null;
-  historyLoading: boolean;
+  token: string;
+  historyRefreshKey: number;
+  onUnauthorized: () => void;
   mode: InspectorMode;
   tab: DetailTab;
   form: MonitorDraft;
@@ -2000,7 +1941,6 @@ function Inspector({
   onMonitorSave: (id: string, patch: MonitorConfigPatch) => void | Promise<void>;
   onMonitorRun: (id: string) => void | Promise<void>;
   onMonitorDelete: (monitor: MonitorConfig) => void;
-  onHistoryRetry: () => void;
   onFormChange: (form: MonitorDraft) => void;
   onCreate: () => void;
 }) {
@@ -2065,7 +2005,9 @@ function Inspector({
             />
           </Tabs.Panel>
           <Tabs.Panel id="history">
-            <HistoryPanel error={historyError} history={history} loading={historyLoading} onRetry={onHistoryRetry} />
+            {monitor && tab === "history" && token ? <Suspense fallback={<div className="notice-panel">Loading history…</div>}>
+              <MonitorHistory key={monitor.id} monitor={monitor} regions={summary.regions} token={token} refreshKey={historyRefreshKey} onUnauthorized={onUnauthorized} />
+            </Suspense> : <div className="notice-panel">Verify your admin session to view history.</div>}
           </Tabs.Panel>
           <Tabs.Panel id="regions">
             <CoveragePanel latest={latest} monitor={monitor} regions={summary.regions} />
@@ -2135,47 +2077,6 @@ function OverviewPanel({
         Run {enabledRegionCount}-region sample
       </Button>
       <p className="field-note">One sample uses {enabledRegionCount} probes. {formatNumber(remainingBudget)} remain in today’s UTC budget.</p>
-    </div>
-  );
-}
-
-function HistoryPanel({
-  error,
-  history,
-  loading,
-  onRetry
-}: {
-  error: string | null;
-  history: ProbeResult[];
-  loading: boolean;
-  onRetry: () => void;
-}) {
-  if (loading) return <div className="notice-panel">Loading recent probe results...</div>;
-  if (error) {
-    return (
-      <div className="notice-panel danger" role="alert">
-        <AlertTriangle size={16} />
-        <span>{error}</span>
-        <Button onPress={onRetry} size="sm" type="button" variant="secondary">
-          <RefreshCw size={14} />
-          Retry
-        </Button>
-      </div>
-    );
-  }
-  if (!history.length) return <div className="notice-panel">No probe history recorded for this monitor.</div>;
-  return (
-    <div className="history-list">
-      {history.map((result) => (
-        <div className="history-row" key={result.id}>
-          <span className={`status-dot ${result.resultType === "infrastructure" ? "stale" : result.ok ? "active" : "failed"}`} />
-          <div>
-            <strong>{result.regionId.toUpperCase()} · {result.resultType === "infrastructure" ? "Probe unavailable" : result.status ?? result.error ?? "error"}</strong>
-            <span>{relativeTime(result.checkedAt)} · {result.latencyMs === null ? "no latency" : `${result.latencyMs} ms`}</span>
-          </div>
-          <span title={result.error || undefined}>{result.resultType === "infrastructure" ? compactText(result.error || "Unknown", 38) : result.entryColo || result.placement || "-"}</span>
-        </div>
-      ))}
     </div>
   );
 }

@@ -2,7 +2,10 @@ import { requireAdmin, requireInternal } from "./auth";
 import { applyGlobalDailyCap } from "./budget";
 import { estimateCost } from "./cost";
 import { dispatchJobs } from "./dispatch";
-import type { ProbeJob, ProbeResult, RuntimeEnv } from "./domain";
+import { getDiagnostics, recordSchedulerHeartbeat } from "./diagnostics";
+import { handleMonitorHistory } from "./history";
+import type { MonitorConfig, ProbeJob, ProbeResult, RegionConfig, RuntimeEnv } from "./domain";
+import type { SchedulerCancellation } from "./storage";
 import { createId, nowIso, parsePositiveInt, RESULT_BATCH_LIMIT } from "./domain";
 import { parseProbeJobs, runProbeJobs } from "./probe";
 import { buildSchedulePlan } from "./scheduler";
@@ -16,6 +19,7 @@ import {
   deleteMonitor,
   expireStaleIncidents,
   getRunStatus,
+  getSchedulingSnapshot,
   getSummary,
   listMonitors,
   listProbeResults,
@@ -62,30 +66,36 @@ export default {
   async scheduled(event: ScheduledEvent, env: RuntimeEnv, ctx: ExecutionContext): Promise<void> {
     const directPersistence = directPersistenceGuard(env);
     env = directPersistence.env;
+    const scheduledAt = event.scheduledTime ? new Date(event.scheduledTime) : new Date();
+    await recordSchedulerHeartbeat(env, scheduledAt);
     await bootstrapDefaults(env);
     await expireStaleIncidents(env);
     const baseUrl = env.PUBLIC_BASE_URL || "http://localhost:8787";
-    const scheduledAt = event.scheduledTime ? new Date(event.scheduledTime) : new Date();
     let monitors = applyGlobalDailyCap(await listMonitors(env), parsePositiveInt(env.MAX_DAILY_PROBES, 10_000));
-    const regions = await listRegions(env);
+    let regions = await listRegions(env);
     const runId = scheduledRunId(scheduledAt);
     let plan = buildSchedulePlan(monitors, regions, scheduledAt, runId);
-    const availableMonitorIds = new Set(monitors.map((monitor) => monitor.id));
+    const recoveryEligibility = {
+      monitors: new Map(monitors.map((monitor) => [monitor.id, monitor])),
+      regions: new Map(regions.map((region) => [region.id, region]))
+    };
     if (scheduledAt.getUTCMinutes() === 0) {
       ctx.waitUntil(cleanupRetention(env).catch((caught) => logBackgroundFailure("retention_cleanup_failed", caught)));
     }
     const recovered = await claimRecoverableSchedulerRun(env, (jobs) => {
-      // One recovery claim, one monitor refresh, two completion writes per run, and four statements
+      // One recovery claim, one configuration snapshot, two completion writes per run, and four statements
       // for the new minute's claim/reservation. Check both runs before either
       // dispatches; a persistence chunk does not get a fresh invocation budget.
-      const activeRecoveryJobs = jobs.filter((job) => availableMonitorIds.has(job.monitor.id));
+      const activeRecoveryJobs = jobs.filter((job) => !recoveryCancellationReason(job, recoveryEligibility));
       directPersistence.assertCapacity([activeRecoveryJobs.length, plan.jobs.length], 4 + (plan.jobs.length ? 6 : 0));
     });
     if (recovered) {
-      await executeScheduledJobs(env, ctx, recovered, baseUrl, availableMonitorIds);
-      // Recovery may take minutes. Rebuild the new run from current visibility
-      // before reserving budget, so deletion during recovery also cancels it.
-      monitors = applyGlobalDailyCap(await listMonitors(env), parsePositiveInt(env.MAX_DAILY_PROBES, 10_000));
+      await executeScheduledJobs(env, ctx, recovered, baseUrl, recoveryEligibility);
+      // Recovery may take minutes. Refresh both tables before reserving new work
+      // so monitor and region changes during recovery affect the rebuilt plan.
+      const current = await getSchedulingSnapshot(env);
+      monitors = applyGlobalDailyCap(current.monitors, parsePositiveInt(env.MAX_DAILY_PROBES, 10_000));
+      regions = current.regions;
       plan = buildSchedulePlan(monitors, regions, scheduledAt, runId);
     }
     if (!plan.jobs.length) return;
@@ -123,19 +133,45 @@ export default {
   }
 };
 
+interface RecoveryEligibility {
+  monitors: Map<string, MonitorConfig>;
+  regions: Map<string, RegionConfig>;
+}
+
+function recoveryCancellationReason(job: ProbeJob, eligibility: RecoveryEligibility): string | null {
+  const monitor = eligibility.monitors.get(job.monitor.id);
+  if (!monitor) return "monitor_deleted";
+  if (!monitor.enabled) return "monitor_disabled";
+  if (monitor.configVersion !== job.monitor.configVersion) return "monitor_config_changed";
+  const region = eligibility.regions.get(job.region.id);
+  if (!region) return "region_missing";
+  return region.enabled ? null : "region_disabled";
+}
+
 async function executeScheduledJobs(
   env: RuntimeEnv,
   ctx: ExecutionContext,
   run: { id: string; startedAt: string; jobs: ProbeJob[] },
   baseUrl: string,
-  availableMonitorIds?: Set<string>
+  recoveryEligibility?: RecoveryEligibility
 ): Promise<void> {
+  const cancellations: SchedulerCancellation[] = [];
   try {
-    // Preserve original result IDs when a recovery skips deleted monitors.
+    // Assign identities before filtering so cancellations never renumber survivors.
     const jobs = run.jobs.map((job, index) => ({ ...job, jobId: job.jobId ?? `${job.runId}:${index}` }));
-    const active = jobs.filter((job) => !availableMonitorIds || availableMonitorIds.has(job.monitor.id));
-    const cancelledResultIds = jobs.filter((job) => availableMonitorIds && !availableMonitorIds.has(job.monitor.id))
-      .map((job) => `res_${job.jobId}`);
+    const active: ProbeJob[] = [];
+    for (const job of jobs) {
+      const reason = recoveryEligibility ? recoveryCancellationReason(job, recoveryEligibility) : null;
+      if (reason) {
+        cancellations.push({ resultId: `res_${job.jobId}`, reason });
+      } else {
+        const region = recoveryEligibility?.regions.get(job.region.id);
+        // Routing can change without changing the monitor's configuration version.
+        active.push(region ? { ...job, region: {
+          id: region.id, label: region.label, placementRegion: region.placementRegion, workerUrl: region.workerUrl
+        } } : job);
+      }
+    }
     const outcome = await dispatchJobs(env, active, baseUrl);
     await persistResults(env, ctx, outcome.results);
     await recordSchedulerRunSafely(env, {
@@ -145,11 +181,11 @@ async function executeScheduledJobs(
       plannedJobs: run.jobs.length,
       dispatchedJobs: outcome.dispatchedJobs,
       skippedJobs: Math.max(0, run.jobs.length - outcome.dispatchedJobs),
-      cancelledResultIds
+      cancellations
     });
     await recordWorkerInvocationSafely(env, 1 + outcome.probeInvocations);
   } catch (caught) {
-    await retryScheduledRun(env, run.id, caught instanceof Error ? caught.message : "scheduled_run_failed");
+    await retryScheduledRun(env, run.id, caught instanceof Error ? caught.message : "scheduled_run_failed", cancellations);
     console.error("scheduled_run_failed", run.id, caught instanceof Error ? caught.message : caught);
   }
 }
@@ -168,6 +204,22 @@ async function handleControlRequest(
     const unauthorized = requireAdmin(request, env);
     if (unauthorized) return unauthorized;
     return Response.json(await getSummary(env));
+  }
+
+  if (request.method === "GET" && url.pathname === "/api/diagnostics") {
+    const unauthorized = requireAdmin(request, env);
+    if (unauthorized) return unauthorized;
+    return Response.json(await getDiagnostics(env));
+  }
+
+  const historyMatch = /^\/api\/monitors\/([^/]+)\/history$/.exec(url.pathname);
+  if (request.method === "GET" && historyMatch?.[1]) {
+    const unauthorized = requireAdmin(request, env);
+    if (unauthorized) return unauthorized;
+    let monitorId: string;
+    try { monitorId = decodeURIComponent(historyMatch[1]); }
+    catch { return jsonError("Invalid monitor ID.", 400); }
+    return handleMonitorHistory(request, env, monitorId);
   }
 
   if (request.method === "GET" && url.pathname === "/api/cost") {
@@ -371,16 +423,22 @@ async function handleProbeRole(request: Request, env: RuntimeEnv): Promise<Respo
 async function handleInternalProbe(request: Request, env: RuntimeEnv): Promise<Response> {
   if (request.method !== "POST") return jsonError("Method not allowed", 405);
   const allowLocal = env.ALLOW_LOCAL_PROBES === "true" && new URL(request.url).hostname === "localhost";
+  if (env.ROLE !== "probe" && !allowLocal) return jsonError("Internal probing requires a probe Worker.", 404);
   if (!allowLocal) {
     const unauthorized = requireInternal(request, env);
     if (unauthorized) return unauthorized;
   }
+  const regionId = env.REGION_ID?.trim();
+  if (env.ROLE === "probe" && !regionId) return jsonError("REGION_ID is required for probe Workers.", 503);
 
   try {
     const jobs = parseProbeJobs(await request.json().catch(() => null), {
       allowPrivateTargets: env.ALLOW_PRIVATE_TARGETS === "true",
       maxJobs: Math.min(5, parsePositiveInt(env.PROBE_BATCH_SIZE, 5))
     });
+    if (regionId && jobs.some((job) => job.region.id !== regionId)) {
+      return jsonError("Probe job region does not match this Worker's REGION_ID.", 400);
+    }
     const concurrency = Math.min(6, parsePositiveInt(env.PROBE_CONCURRENCY, 6));
     const results = await runProbeJobs(request, jobs, concurrency);
     return Response.json({ results });

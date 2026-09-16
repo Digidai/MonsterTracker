@@ -4,7 +4,9 @@ Cloudflare-native website monitoring built on Workers, D1, Queues, R2, Analytics
 
 MonsterTracker deliberately does **not** use Cloudflare Health Checks. It runs your own probe Workers and distributes a daily probe budget across placed regions.
 
-See the [September 2026 upgrade and verification report](docs/plans/2026-09-16-product-upgrade.md) for the current release, review evidence, and remaining limitations.
+Open the deployed dashboard at **[monstertracker.genedai.me](https://monstertracker.genedai.me/)** and sign in with your admin token. The original workers.dev address remains available.
+
+See the [operations and history upgrade report](docs/plans/2026-09-16-operations-and-history.md) and [product upgrade report](docs/plans/2026-09-16-product-upgrade.md) for review evidence and remaining limitations.
 
 ## What It Can And Cannot Promise
 
@@ -129,6 +131,28 @@ The dashboard can update D1-backed runtime configuration without redeploying:
 - Run history: recent cron/manual scheduler runs are persisted in D1 for operational review.
 - Probe history: the inspector loads the latest 100 raw results for the selected monitor.
 - Incident history: open, unconfirmed and resolved incidents remain visible until retention cleanup. Missing evidence never implies recovery.
+- History: **Monitors → target → History** supports 24-hour, 7-day and 30-day windows, region/outcome filters and 50-row cursor pagination. It uses the current configuration version only. The observed pass rate excludes unavailable probes and is not time-based uptime. CSV exports the loaded rows; load additional pages first to include them.
+- Delivery diagnostics: **Usage → Scheduler & delivery** shows the last five-minute scheduler checkpoint, live result/DLQ backlog and actual stored/missing/cancelled results for the last 20 runs. Failed metrics calls remain unavailable, never zero. Diagnostics are authenticated and refresh on demand.
+- Configuration backup: **Settings → Configuration backup** exports a versioned JSON of monitor settings from the displayed snapshot. It excludes tokens, deployment bindings and history. Automatic import/restore is not yet implemented.
+- Recovery safety: paused/deleted monitors, changed configuration versions and disabled regions cancel obsolete recovery jobs. Eligible recovered jobs use current region routes. Checks already dispatched may still finish. Probe Workers validate their configured region identity; production control Workers cannot act as probes.
+
+The heartbeat adds at most 288 logical writes per UTC day under normal cron delivery, without creating Queue messages. D1 retention covers raw evidence and closed incidents (measured from closure). **R2 retention is independent:** configure and review a bucket lifecycle policy separately; this release does not automatically delete existing archives. The deployed bucket was checked on 2026-09-16 and only had the incomplete-multipart abort rule, with no object expiration.
+
+### Custom domains
+
+Use a Workers Custom Domain on an active zone in the same account. In your private deployment configuration, include all existing custom domains as well as the new domain:
+
+```jsonc
+{
+  "workers_dev": true,
+  "routes": [
+    { "pattern": "monitor.example.com", "custom_domain": true }
+  ],
+  "vars": { "PUBLIC_BASE_URL": "https://monitor.example.com" }
+}
+```
+
+Merge these fields into your complete config; do not replace other bindings, variables or existing routes. Cloudflare provisions the DNS record and certificate. See [Workers Custom Domains](https://developers.cloudflare.com/workers/configuration/routing/custom-domains/).
 - Freshness states: target failure, unavailable probes, incomplete regional coverage, stale evidence and paused monitors are separate states.
 - Safe editing: unsaved changes are protected during navigation and preserved through token reauthentication. Save errors remain next to the form.
 - Efficient reads: history is loaded only when its tab is opened; superseded requests are canceled. Static assets bypass Worker execution.

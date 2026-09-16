@@ -55,6 +55,10 @@
       {
         "binding": "RESULTS_QUEUE",
         "queue": "monstertracker-results"
+      },
+      {
+        "binding": "RESULTS_DLQ",
+        "queue": "monstertracker-results-dlq"
       }
     ],
     "consumers": [

@@ -17,6 +17,10 @@
 @import "@heroui/styles/components/tooltip.css" layer(components);
 @import "@heroui/styles/components/scroll-shadow.css" layer(components);
 @import "@heroui/styles/components/separator.css" layer(components);
+@import "@heroui/styles/components/select.css" layer(components);
+@import "@heroui/styles/components/list-box.css" layer(components);
+@import "@heroui/styles/components/popover.css" layer(components);
+@import "@heroui/styles/components/label.css" layer(components);
 @import "@heroui-pro/react/css/components/sidebar.css";
 @import "@heroui-pro/react/css/components/sheet.css";
 @import "@heroui-pro/react/css/components/segment.css";
@@ -31,6 +35,35 @@
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
 }
+
+.history-panel, .diagnostics-content { display: grid; gap: 16px; }
+.history-panel { padding: 4px 0 20px; }
+.panel-help { margin: 0; font-size: 12px; color: #64736d; line-height: 1.6; }
+.history-filters { display: grid; gap: 10px; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+.history-filters > :last-child { grid-column: 1 / -1; }
+.history-filters .select__trigger { min-width: 0; font-size: 12px; }
+.history-filters .label { font-size: 12px; }
+.history-actions, .diagnostics-bindings { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+.history-actions .button { font-size: 11px; }
+.history-stats { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1px; border: 1px solid #e1e8e4; border-radius: 12px; overflow: hidden; background: #e1e8e4; }
+.history-stats > div { display: grid; gap: 6px; padding: 12px; background: #f8faf9; }
+.history-stats span { color: #65746e; font-size: 11px; }
+.history-stats strong { font-size: 22px; letter-spacing: -0.5px; }
+.history-entry { display: grid; gap: 6px; border-bottom: 1px solid #e6ece8; padding: 13px 0; font-size: 12px; }
+.history-entry-heading, .delivery-heading { display: flex; justify-content: space-between; gap: 10px; align-items: center; }
+.history-entry-heading strong { min-width: 0; }
+.history-entry time, .history-entry > span { color: #68776f; }
+.history-entry p, .delivery-error { margin: 0; color: #aa384c; overflow-wrap: anywhere; }
+.diagnostic-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
+.diagnostic-tile { border: 1px solid #e1e8e4; border-radius: 12px; padding: 16px; display: flex; flex-direction: column; gap: 8px; background: #f8faf9; }
+.diagnostic-tile > span, .diagnostics-bindings { font-size: 12px; color: #64736d; }
+.diagnostic-tile > strong { font-size: 20px; }
+.diagnostic-tile p { margin: 0; font-size: 12px; color: #64736d; line-height: 1.5; overflow-wrap: anywhere; }
+.delivery-list { display: grid; gap: 10px; grid-template-columns: repeat(2, minmax(0, 1fr)); max-height: 620px; overflow: auto; }
+.delivery-row { display: grid; gap: 7px; border: 1px solid #e1e8e4; border-radius: 10px; padding: 14px; font-size: 12px; }
+.delivery-row > span { color: #64736d; }
+.delivery-row code { font-size: 10px; color: #75817b; overflow-wrap: anywhere; }
+@media (max-width: 900px) { .diagnostic-grid, .delivery-list { grid-template-columns: minmax(0, 1fr); } }
 
 * {
   box-sizing: border-box;
